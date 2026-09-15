@@ -185,13 +185,6 @@ function renderPage(): string {
   .presence-item .since { margin-left: auto; color: var(--muted); font-size: 12px; }
   .presence-group { display: grid; gap: 6px; }
   .presence-group-name { color: var(--muted); font-size: 12px; margin-top: 6px; }
-  /* Headcount in the header: alive only when someone is actually connected. */
-  .chip {
-    font-size: 12px; padding: 4px 10px; border-radius: 999px;
-    border: 1px solid rgba(63,185,80,.4); color: var(--ok); background: rgba(63,185,80,.1);
-  }
-  .chip.hidden { display: none; }
-  .chip:hover { border-color: var(--ok); }
   .badge {
     font-size: 11px; padding: 2px 8px; border-radius: 999px;
     border: 1px solid var(--line); color: var(--muted); text-transform: uppercase; letter-spacing: .4px;
@@ -259,7 +252,6 @@ function renderPage(): string {
 <header>
   <h1>codexm <span>控制台</span></h1>
   <div class="meta" id="meta">加载中…</div>
-  <button class="chip hidden" id="presenceSummary" title="查看当前使用者"></button>
   <div class="spacer"></div>
   <button id="addBtn" class="primary">添加账号</button>
   <button id="relaunchBtn">重启桌面端</button>
@@ -336,7 +328,6 @@ function renderPage(): string {
   const presenceModal = document.getElementById("presenceModal");
   const presenceSub = document.getElementById("presenceSub");
   const presenceList = document.getElementById("presenceList");
-  const presenceSummaryBtn = document.getElementById("presenceSummary");
   let presenceName = "";
   // Presence arrives in a second request, so the last state is kept around to
   // redraw the cards once the headcount lands.
@@ -572,25 +563,12 @@ function renderPage(): string {
     }
   }
 
-  // The headcount only says something when a registry is configured, so an
-  // unreachable server simply hides the chip instead of showing "0 人在使用".
-  function renderPresenceSummary() {
-    if (!presenceSummary || !presenceSummary.total_users) {
-      presenceSummaryBtn.classList.add("hidden");
-      return;
-    }
-    presenceSummaryBtn.classList.remove("hidden");
-    presenceSummaryBtn.textContent =
-      presenceSummary.total_users + " 人在使用 · " + presenceSummary.accounts_in_use + " 个账号";
-  }
-
   async function loadPresenceSummary() {
     try {
       presenceSummary = await api("/api/presence");
     } catch {
       presenceSummary = null;
     }
-    renderPresenceSummary();
     // Cards carry a per-account count, so they have to be drawn again.
     if (lastState) render(lastState);
   }
@@ -1152,9 +1130,7 @@ function renderPage(): string {
   document.getElementById("presenceRefreshBtn").addEventListener("click", function () {
     showPresence(presenceName || null);
   });
-  presenceSummaryBtn.addEventListener("click", function () {
-    showPresence(null);
-  });
+
 
   reload();
   setInterval(reload, 5000);
@@ -1678,13 +1654,24 @@ async function deleteAccountFromRegistry(options: {
  */
 async function syncWithRegistryAfterChange(options: {
   store: AccountStore;
+  /** Just-added accounts: they must survive the mirror step of this pass. */
+  freshLocalNames?: readonly string[];
   debugLog?: DebugLogger;
 }): Promise<{ synced: boolean; warnings: string[] }> {
+  let remote;
+  try {
+    remote = await resolveRemote(options.store, null);
+  } catch {
+    // No registry configured: a single-machine setup, nothing to converge.
+    return { synced: false, warnings: [] };
+  }
+
   try {
     const clientId = await resolveRegistryClientId(options.store.paths.codexTeamDir);
     const result = await runAutoSyncOnce({
       store: options.store,
       clientId,
+      freshLocalNames: options.freshLocalNames,
       debugLog: options.debugLog,
     });
     return {
@@ -1694,8 +1681,14 @@ async function syncWithRegistryAfterChange(options: {
         .map((entry) => `registry 同步：「${entry.name}」失败（${entry.error ?? "未知原因"}）`),
     };
   } catch (error) {
-    options.debugLog?.(`ui: registry sync skipped: ${(error as Error).message}`);
-    return { synced: false, warnings: [] };
+    // The local change stands, but it is not on the server yet — say so
+    // instead of letting a silent failure look like a successful add.
+    const reason = (error as Error).message;
+    options.debugLog?.(`ui: registry sync failed: ${reason}`);
+    return {
+      synced: false,
+      warnings: [`registry「${remote.name}」同步失败，账号只存在本机：${reason}`],
+    };
   }
 }
 
@@ -1747,6 +1740,7 @@ export async function performUiAddAccount(options: {
     options.debugLog?.(`ui add: saved apikey account ${name}`);
     const registry = await syncWithRegistryAfterChange({
       store: options.store,
+      freshLocalNames: [name],
       debugLog: options.debugLog,
     });
 
@@ -1771,6 +1765,7 @@ export async function performUiAddAccount(options: {
     });
     const registry = await syncWithRegistryAfterChange({
       store: options.store,
+      freshLocalNames: [name],
       debugLog: options.debugLog,
     });
 

@@ -31,7 +31,9 @@ import { exportShareBundle } from "./share-bundle.js";
  *
  *   1. mirror  — every account the server lists is created or overwritten
  *                locally, and every account it does not list is deleted, so
- *                the local roster cannot drift from the server
+ *                the local roster cannot drift from the server (accounts in
+ *                `freshLocalNames` are spared: they were just added here and
+ *                are uploaded by step 3 in the same pass)
  *   2. refresh — refresh what is due, but only under a server-issued lease so
  *                two machines never rotate the same refresh token
  *   3. push    — upload the copies that are newer locally (a refresh from step
@@ -74,6 +76,12 @@ export interface AutoSyncOptions {
   remoteName?: string | null;
   clientId: string;
   now?: Date;
+  /**
+   * Accounts this machine just created. The mirror step reads "absent on the
+   * server" as local drift and deletes, which would throw away an account that
+   * was added a second ago and has not been uploaded yet (step 3 does that).
+   */
+  freshLocalNames?: readonly string[];
   debugLog?: (message: string) => void;
 }
 
@@ -133,6 +141,7 @@ export async function runAutoSyncOnce(options: AutoSyncOptions): Promise<AutoSyn
   const results: AutoSyncAccountResult[] = [];
   const adopted = new Set<string>();
   const removed = new Set<string>();
+  const freshLocalNames = new Set(options.freshLocalNames ?? []);
 
   // Mirror, part one: take the server's copy of everything it knows about.
   // A local copy only survives when it is newer — and step 3 uploads it, so
@@ -174,6 +183,12 @@ export async function runAutoSyncOnce(options: AutoSyncOptions): Promise<AutoSyn
   // under a running Codex session would break it.
   for (const account of accounts) {
     if (remoteByName.has(account.name)) {
+      continue;
+    }
+
+    if (freshLocalNames.has(account.name)) {
+      // Added here moments ago: step 3 uploads it, so the server learns about
+      // it in this very pass. Deleting it now would drop the only copy.
       continue;
     }
 

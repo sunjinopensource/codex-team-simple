@@ -26,13 +26,16 @@ import { exportShareBundle } from "./share-bundle.js";
 /**
  * Unattended registry convergence.
  *
- * Every machine using an account runs the same three steps, so tokens stay in
- * sync with no manual action:
+ * The server is the single source of truth: after a pass, this machine holds
+ * exactly what the server holds — same accounts, same tokens.
  *
- *   1. adopt  — take the registry copy when it holds a newer token
+ *   1. mirror  — every account the server lists is created or overwritten
+ *                locally, and every account it does not list is deleted, so
+ *                the local roster cannot drift from the server
  *   2. refresh — refresh what is due, but only under a server-issued lease so
  *                two machines never rotate the same refresh token
- *   3. push   — offer local-only changes (manual replace/import) upstream
+ *   3. push    — upload the copies that are newer locally (a refresh from step
+ *                2, or an account only this machine has), so both sides match
  *
  * Step 1 runs first on purpose: refreshing a token another machine already
  * rotated would fail and would waste the lease.
@@ -45,6 +48,7 @@ const CLIENT_ID_FILE_NAME = "registry-client-id.json";
 
 export type AutoSyncAction =
   | "pulled"
+  | "removed"
   | "refreshed"
   | "pushed"
   | "unchanged"
@@ -122,38 +126,78 @@ export async function runAutoSyncOnce(options: AutoSyncOptions): Promise<AutoSyn
   const { accounts } = await options.store.listAccounts();
   const remoteAccounts = await listRemoteAccounts(config);
   const remoteByName = new Map(remoteAccounts.map((entry) => [entry.name, entry]));
+  const localByName = new Map(accounts.map((account) => [account.name, account]));
   const currentStatus = await options.store.getCurrentStatus();
   const activeNames = new Set(currentStatus.matched_accounts);
 
   const results: AutoSyncAccountResult[] = [];
   const adopted = new Set<string>();
+  const removed = new Set<string>();
 
+  // Mirror, part one: take the server's copy of everything it knows about.
+  // A local copy only survives when it is newer — and step 3 uploads it, so
+  // the two sides still end up identical.
+  for (const remoteAccount of remoteAccounts) {
+    const localAccount = localByName.get(remoteAccount.name);
+
+    if (localAccount) {
+      const localExpiry = await readLocalRegistryExpiry(localAccount.authPath);
+      // Ours stays only when it is provably fresher — step 3 uploads it, so
+      // both sides still end up identical. An unreadable local expiry means
+      // there is nothing to compare, so the server's copy wins.
+      if (localExpiry && !isNewerExpiry(remoteAccount.token_expires_at, localExpiry)) {
+        continue;
+      }
+    }
+
+    try {
+      await adoptRemoteAccount({
+        store: options.store,
+        config,
+        name: remoteAccount.name,
+        activeNames,
+      });
+      adopted.add(remoteAccount.name);
+      options.debugLog?.(`autosync: pulled ${remoteAccount.name} from registry`);
+      results.push({
+        name: remoteAccount.name,
+        action: "pulled",
+        reason: localAccount ? "已用服务器数据覆盖本地" : "服务器新增的账号",
+      });
+    } catch (error) {
+      results.push({ name: remoteAccount.name, action: "failed", error: describeError(error) });
+    }
+  }
+
+  // Mirror, part two: whatever the server does not list is local drift and is
+  // deleted. The account in active use is spared — deleting the auth file
+  // under a running Codex session would break it.
   for (const account of accounts) {
-    const remoteAccount = remoteByName.get(account.name);
-    if (!remoteAccount) {
+    if (remoteByName.has(account.name)) {
       continue;
     }
-    const localExpiry = await readLocalRegistryExpiry(account.authPath);
-    if (!isNewerExpiry(remoteAccount.token_expires_at, localExpiry)) {
+
+    if (activeNames.has(account.name)) {
+      results.push({
+        name: account.name,
+        action: "skipped",
+        reason: "服务器上已没有此账号，但它正在使用中，未删除",
+      });
       continue;
     }
 
     try {
-      await adoptRemoteAccount({ store: options.store, config, account, activeNames });
-      adopted.add(account.name);
-      options.debugLog?.(`autosync: adopted newer registry token for ${account.name}`);
-      results.push({
-        name: account.name,
-        action: "pulled",
-        reason: "registry holds a newer token",
-      });
+      await options.store.removeAccount(account.name);
+      removed.add(account.name);
+      options.debugLog?.(`autosync: removed ${account.name}: no longer on the registry`);
+      results.push({ name: account.name, action: "removed", reason: "服务器上已没有此账号" });
     } catch (error) {
       results.push({ name: account.name, action: "failed", error: describeError(error) });
     }
   }
 
   for (const account of accounts) {
-    if (adopted.has(account.name)) {
+    if (adopted.has(account.name) || removed.has(account.name)) {
       continue;
     }
 
@@ -212,6 +256,8 @@ export async function runAutoSyncLoop(
     intervalMs?: number;
     jitterMs?: number;
     onRun?: (result: AutoSyncRunResult) => void | Promise<void>;
+    /** A pass that never reached the server (offline, bad url/token). */
+    onError?: (error: unknown) => void | Promise<void>;
   },
 ): Promise<void> {
   const intervalMs = options.intervalMs ?? AUTO_SYNC_INTERVAL_MS;
@@ -224,6 +270,7 @@ export async function runAutoSyncLoop(
     } catch (error) {
       // A failed pass (server down, bad token) must not kill the loop.
       options.debugLog?.(`autosync: run failed: ${describeError(error)}`);
+      await options.onError?.(error);
     }
 
     if (options.signal?.aborted) {
@@ -237,22 +284,22 @@ export async function runAutoSyncLoop(
 async function adoptRemoteAccount(options: {
   store: AccountStore;
   config: RemoteConfig;
-  account: ManagedAccount;
+  name: string;
   activeNames: Set<string>;
 }): Promise<void> {
-  const raw = await downloadBundle(options.config, options.account.name);
+  const raw = await downloadBundle(options.config, options.name);
   const bundle = parseShareBundle(JSON.stringify(raw));
-  await options.store.addAccountSnapshot(options.account.name, bundle.auth.auth_json, {
+  await options.store.addAccountSnapshot(options.name, bundle.auth.auth_json, {
     force: true,
     rawConfig: bundle.auth.config_toml ?? null,
   });
 
-  if (options.activeNames.has(options.account.name)) {
+  if (options.activeNames.has(options.name)) {
     // Same account, new token: re-apply so a running Codex session picks it
     // up, without changing which account is selected.
     await switchAccountPreservingProxyRuntime({
       store: options.store,
-      name: options.account.name,
+      name: options.name,
     });
   }
 }

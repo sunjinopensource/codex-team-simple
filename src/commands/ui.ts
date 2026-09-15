@@ -35,10 +35,25 @@ import {
   resolveRegistryClientId,
   runAutoSyncLoop,
   runAutoSyncOnce,
+  type AutoSyncAction,
   type AutoSyncRunResult,
 } from "./autosync.js";
 
 type DebugLogger = (message: string) => void;
+
+/**
+ * Sync health for the page: it has to tell "本地就是服务器的数据" apart from
+ * "服务器连不上，看到的是本机旧数据".
+ */
+interface UiSyncStatus {
+  enabled: boolean;
+  remote: string | null;
+  last_run_at: string | null;
+  last_success_at: string | null;
+  last_error: string | null;
+  offline: boolean;
+  actions: Record<string, AutoSyncAction>;
+}
 
 /**
  * The console is its own presentation surface: it renders raw quota values
@@ -98,6 +113,15 @@ function renderPage(): string {
   }
   button.danger:hover { border-color: var(--hot); background: rgba(255,86,86,.12); }
   button.danger.armed { background: var(--hot); border-color: var(--hot); color: #20090a; font-weight: 600; }
+  .banner {
+    margin: 16px 28px 0; padding: 11px 14px; border-radius: 10px; font-size: 13px;
+    background: var(--panel); border: 1px solid var(--line);
+  }
+  .banner.hidden { display: none; }
+  .banner.warn { border-left: 3px solid var(--warn); background: rgba(217,160,58,.12); }
+  .banner.error { border-left: 3px solid var(--hot); background: rgba(240,96,58,.12); }
+  /* Server unreachable: the meters are local cache, so dim them. */
+  .card.stale .meters { opacity: .45; }
   main { padding: 24px 28px 48px; display: grid; gap: 16px; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); }
   .card {
     background: linear-gradient(180deg, var(--panel) 0%, var(--panel-2) 100%);
@@ -195,9 +219,10 @@ function renderPage(): string {
   <button id="addBtn" class="primary">添加账号</button>
   <button id="relaunchBtn">重启桌面端</button>
   <button id="refreshBtn">刷新配额</button>
-  <button id="syncBtn">同步到 registry</button>
+  <button id="syncBtn">与服务器对齐</button>
   <button id="quitBtn">退出</button>
 </header>
+<div id="banner" class="banner hidden"></div>
 <main id="grid"></main>
 <div id="toast"></div>
 <div id="addModal" class="modal hidden">
@@ -242,6 +267,7 @@ function renderPage(): string {
   const token = new URLSearchParams(location.search).get("token") || "";
   const grid = document.getElementById("grid");
   const meta = document.getElementById("meta");
+  const banner = document.getElementById("banner");
   const toastBox = document.getElementById("toast");
   let busy = false;
 
@@ -302,10 +328,54 @@ function renderPage(): string {
     return hours < 24 ? hours + " 小时后重置" : Math.round(hours / 24) + " 天后重置";
   }
 
+  function timeAgo(value) {
+    const date = new Date(value);
+    if (isNaN(date.getTime())) return "";
+    const minutes = Math.round((Date.now() - date.getTime()) / 60000);
+    if (minutes < 1) return "刚刚";
+    if (minutes < 60) return minutes + " 分钟前";
+    const hours = Math.round(minutes / 60);
+    return hours < 24 ? hours + " 小时前" : Math.round(hours / 24) + " 天前";
+  }
+
+  function syncLabel(action) {
+    if (action === "pulled") return "已从服务器拉取";
+    if (action === "removed") return "服务器上已删除";
+    if (action === "refreshed") return "已刷新并上传";
+    if (action === "pushed") return "已上传到服务器";
+    if (action === "failed") return "同步失败";
+    if (action === "skipped") return "跳过同步";
+    if (action === "unchanged") return "与服务器一致";
+    return "";
+  }
+
+  // The page must never look authoritative when the server could not be
+  // reached: everything below the banner is local data until a pass succeeds.
+  function renderBanner(state) {
+    const sync = state.sync || {};
+    if (!sync.enabled) {
+      banner.className = "banner warn";
+      banner.textContent = "未配置 registry 服务器：显示的是本机账号，不会与服务器同步。";
+      return;
+    }
+    if (sync.offline) {
+      banner.className = "banner error";
+      banner.textContent = "连不上服务器" + (sync.remote ? "「" + sync.remote + "」" : "") + "：" +
+        (sync.last_error || "未知错误") + "。下面显示的是本机数据" +
+        (sync.last_success_at ? "，上次成功同步 " + timeAgo(sync.last_success_at) : "，尚未成功同步过") + "。";
+      return;
+    }
+    banner.className = "banner hidden";
+  }
+
   function render(state) {
     const accounts = state.accounts || [];
+    const sync = state.sync || {};
+    const offline = sync.offline === true;
+    renderBanner(state);
     meta.textContent = accounts.length + " 个账号 · " +
       (state.remote ? "registry " + state.remote.name + "（" + (state.remote.accounts || []).length + " 个）" : "未配置 registry") +
+      (sync.last_success_at ? " · 上次同步 " + timeAgo(sync.last_success_at) : "") +
       (state.warnings && state.warnings.length ? " · " + state.warnings.length + " 条警告" : "");
 
     if (!accounts.length) {
@@ -324,7 +394,8 @@ function renderPage(): string {
       const blocked = status === "error" || status === "unsupported";
       const relogin = !!account.relogin_error;
       const errorText = relogin ? "登录态已失效，请重新登录" : quota.error_message;
-      return '<div class="card' + (account.current ? " current" : "") + '">' +
+      const syncState = syncLabel((sync.actions || {})[account.name]);
+      return '<div class="card' + (account.current ? " current" : "") + (offline ? " stale" : "") + '">' +
         '<div class="card-top">' +
           '<div class="name">' + esc(account.name) + '</div>' +
           '<div class="badge' + (relogin ? " hot" : account.current ? " live" : "") + '">' +
@@ -336,7 +407,8 @@ function renderPage(): string {
           '</div>' +
         '</div>' +
         '<div class="sub">' + esc(plan) + ' · ' + esc(account.account_id || "无账号 ID") +
-          (blocked && errorText ? " · " + esc(errorText) : "") + '</div>' +
+          (blocked && errorText ? " · " + esc(errorText) : "") +
+          (offline ? " · 服务器不可达，这是本机数据" : syncState ? " · " + syncState : "") + '</div>' +
         '<div class="meters">' +
           meter("5 小时" + (five ? " · " + resetHint(five.reset_at) : ""), five) +
           meter("每周" + (week ? " · " + resetHint(week.reset_at) : ""), week) +
@@ -903,7 +975,10 @@ async function readJsonBody(req: IncomingMessage): Promise<Record<string, unknow
   }
 }
 
-async function buildState(store: AccountStore): Promise<Record<string, unknown>> {
+async function buildState(
+  store: AccountStore,
+  sync: UiSyncStatus,
+): Promise<Record<string, unknown>> {
   const { accounts, warnings } = await store.listAccounts();
   const current = await store.getCurrentStatus();
   const currentNames = new Set(current.matched_accounts ?? []);
@@ -934,6 +1009,7 @@ async function buildState(store: AccountStore): Promise<Record<string, unknown>>
     },
     remote,
     warnings,
+    sync,
   };
 }
 
@@ -943,6 +1019,16 @@ function formatRefreshMessage(sweep: { refreshed: unknown[]; failed: unknown[]; 
 
 function formatSyncMessage(summary: { pushed: number; skipped: number; failed: number }): string {
   return `同步完成：推送 ${summary.pushed} 个，跳过 ${summary.skipped} 个，失败 ${summary.failed} 个。`;
+}
+
+function formatAutoSyncMessage(result: AutoSyncRunResult): string {
+  const counts = new Map<AutoSyncAction, number>();
+  for (const entry of result.accounts) {
+    counts.set(entry.action, (counts.get(entry.action) ?? 0) + 1);
+  }
+  return `已与服务器对齐：拉取 ${counts.get("pulled") ?? 0} 个，删除 ${counts.get("removed") ?? 0} 个，` +
+    `刷新 ${counts.get("refreshed") ?? 0} 个，推送 ${counts.get("pushed") ?? 0} 个，` +
+    `失败 ${counts.get("failed") ?? 0} 个。`;
 }
 
 function openBrowser(url: string): void {
@@ -1622,7 +1708,7 @@ export async function handleUiCommand(options: {
         }
 
         if (req.method === "GET" && url.pathname === "/api/state") {
-          sendJson(res, 200, await buildState(store));
+          sendJson(res, 200, await buildState(store, syncStatus));
           return;
         }
 
@@ -1746,11 +1832,14 @@ export async function handleUiCommand(options: {
         }
 
         if (req.method === "POST" && url.pathname === "/api/sync") {
-          const summary = await syncAccountsToRemote({ store });
+          // Manual "match the server now": the same pass the loop runs, so the
+          // button and the schedule cannot drift apart.
+          const result = await runAutoSyncNow();
           sendJson(res, 200, {
-            ok: summary.failed === 0,
-            message: formatSyncMessage(summary),
-            summary,
+            ok: true,
+            message: formatAutoSyncMessage(result),
+            result,
+            status: syncStatus,
           });
           return;
         }
@@ -1760,13 +1849,14 @@ export async function handleUiCommand(options: {
             ok: true,
             enabled: stopAutoSync !== null,
             last_run: lastAutoSync,
+            status: syncStatus,
           });
           return;
         }
 
         if (req.method === "POST" && url.pathname === "/api/autosync") {
           const result = await runAutoSyncNow();
-          sendJson(res, 200, { ok: true, result });
+          sendJson(res, 200, { ok: true, result, status: syncStatus });
           return;
         }
 
@@ -1793,11 +1883,46 @@ export async function handleUiCommand(options: {
   let stopAutoSync: (() => void) | null = null;
   let lastAutoSync: AutoSyncRunResult | null = null;
 
+  // Single source of truth for sync health: both /api/state and /api/autosync
+  // report this, so the page always matches what the loop last saw.
+  const syncStatus: UiSyncStatus = {
+    enabled: false,
+    remote: null,
+    last_run_at: null,
+    last_success_at: null,
+    last_error: null,
+    offline: false,
+    actions: {},
+  };
+
+  function recordAutoSyncRun(result: AutoSyncRunResult): void {
+    syncStatus.remote = result.remote;
+    syncStatus.last_run_at = result.finished_at;
+    syncStatus.last_success_at = result.finished_at;
+    syncStatus.last_error = null;
+    syncStatus.offline = false;
+    syncStatus.actions = Object.fromEntries(
+      result.accounts.map((entry) => [entry.name, entry.action]),
+    );
+  }
+
+  function recordAutoSyncFailure(error: unknown): void {
+    syncStatus.last_run_at = new Date().toISOString();
+    syncStatus.last_error = error instanceof Error ? error.message : String(error);
+    syncStatus.offline = true;
+  }
+
   async function runAutoSyncNow(): Promise<AutoSyncRunResult> {
     const clientId = await resolveRegistryClientId(store.paths.codexTeamDir);
-    const result = await runAutoSyncOnce({ store, clientId, debugLog: options.debugLog });
-    lastAutoSync = result;
-    return result;
+    try {
+      const result = await runAutoSyncOnce({ store, clientId, debugLog: options.debugLog });
+      lastAutoSync = result;
+      recordAutoSyncRun(result);
+      return result;
+    } catch (error) {
+      recordAutoSyncFailure(error);
+      throw error;
+    }
   }
 
   function shutdown(): void {
@@ -1822,12 +1947,15 @@ export async function handleUiCommand(options: {
 
   const wantsTray = options.tray === true && isTraySupported();
 
-  // Unattended convergence with the registry: adopt newer remote tokens,
-  // refresh what is due under a server-issued lease, push local-only changes.
+  // Unattended convergence with the registry: the server is the source of
+  // truth, so each pass mirrors its accounts onto this machine (create,
+  // overwrite, delete), then refreshes and pushes whatever is newer locally.
   // Stays off when no registry remote is configured.
   try {
     const remotes = await readRemotesFile(store);
     if (remotes.default_remote && remotes.remotes[remotes.default_remote]) {
+      syncStatus.enabled = true;
+      syncStatus.remote = remotes.default_remote;
       const clientId = await resolveRegistryClientId(store.paths.codexTeamDir);
       const autoSyncController = new AbortController();
       stopAutoSync = () => autoSyncController.abort();
@@ -1838,10 +1966,16 @@ export async function handleUiCommand(options: {
         debugLog: options.debugLog,
         onRun: (result) => {
           lastAutoSync = result;
+          recordAutoSyncRun(result);
+        },
+        onError: (error) => {
+          // Server unreachable: the page keeps showing local data, flagged.
+          recordAutoSyncFailure(error);
         },
       });
     }
   } catch (error) {
+    syncStatus.last_error = (error as Error).message;
     options.debugLog?.(`ui: auto-sync disabled: ${(error as Error).message}`);
   }
 

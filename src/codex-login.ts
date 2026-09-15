@@ -245,6 +245,21 @@ function writeHtml(response: ServerResponse, status: number, body: string): void
   response.end(body);
 }
 
+/**
+ * The callback port is a fixed one, and a login that was never finished keeps
+ * holding it. Naming the cause beats a bare EADDRINUSE the operator cannot act
+ * on.
+ */
+function describeListenError(error: Error, port: number): Error {
+  const code = (error as NodeJS.ErrnoException).code;
+  if (code === "EADDRINUSE") {
+    return new Error(
+      `登录回调端口 ${port} 被占用：另有一个未完成的登录正在等待回调。请在控制台取消它（关闭授权标签页或点取消），然后重试。`,
+    );
+  }
+  return error;
+}
+
 interface BrowserCallbackServerHandle {
   /** Resolves once the loopback listener is up; rejects when the port is taken. */
   ready: Promise<void>;
@@ -277,6 +292,23 @@ function startBrowserCallbackServer(
       return;
     }
 
+    // The callback port is fixed, so a leftover tab from an earlier login can
+    // replay its callback here while a new login is waiting. Its state belongs
+    // to that other login and says nothing about this one, so ignore it and
+    // keep waiting for our own callback instead of failing this login.
+    const returnedState = url.searchParams.get("state");
+    if (returnedState && returnedState !== state) {
+      writeHtml(
+        response,
+        409,
+        "<h1>这不是当前登录的回调</h1><p>可能是上一次登录的页面被重新加载。请关闭本页，回到 codexm 控制台继续。</p>",
+      );
+      stderr?.write(
+        `Ignoring a callback that carries another login's state (expected ${state}, got ${returnedState}).\n`,
+      );
+      return;
+    }
+
     const error = url.searchParams.get("error");
     if (error) {
       writeHtml(response, 400, "<h1>Codex login failed</h1><p>You can close this window.</p>");
@@ -286,17 +318,9 @@ function startBrowserCallbackServer(
     }
 
     const code = url.searchParams.get("code");
-    const returnedState = url.searchParams.get("state");
     if (!code || !returnedState) {
       writeHtml(response, 400, "<h1>Codex login failed</h1><p>Missing callback parameters.</p>");
       rejectResult(new Error("Codex login callback is missing code or state."));
-      server.close();
-      return;
-    }
-
-    if (returnedState !== state) {
-      writeHtml(response, 400, "<h1>Codex login failed</h1><p>Invalid state.</p>");
-      rejectResult(new Error("Codex login callback state mismatch."));
       server.close();
       return;
     }
@@ -313,7 +337,7 @@ function startBrowserCallbackServer(
   });
 
   server.on("error", (error: Error) => {
-    rejectResult(error);
+    rejectResult(describeListenError(error, port));
   });
 
   const ready = new Promise<void>((resolve, reject) => {

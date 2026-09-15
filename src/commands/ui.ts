@@ -798,6 +798,23 @@ function renderPage(): string {
     return true;
   }
 
+  /**
+   * The login finished, so the callback tab has served its purpose. Closing it
+   * matters: left open, it sits on a localhost callback URL that carries the
+   * old state, and reloading it later would knock over the next login.
+   */
+  function closeAuthorizeWindow() {
+    if (authorizeWindow && !authorizeWindow.closed) {
+      try {
+        authorizeWindow.close();
+      } catch {
+        /* the tab may already be navigating away */
+      }
+    }
+    authorizeWindow = null;
+    authorizeWindowBlank = false;
+  }
+
   /** Closes the placeholder tab only; a tab already on the authorize page stays open. */
   function dropAuthorizeWindow() {
     if (authorizeWindow && authorizeWindowBlank && !authorizeWindow.closed) {
@@ -1051,6 +1068,7 @@ function renderPage(): string {
         stopAddPoller();
         addFlowId = "";
         toast(payload.message, "good");
+        closeAuthorizeWindow();
         closeAddModal();
         await finishAdd(payload.account ? payload.account.name : "", payload.warnings);
         return;

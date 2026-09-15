@@ -1,0 +1,61 @@
+{
+  "name": "codex-team",
+  "version": "0.0.27",
+  "description": "Manage multiple Codex ChatGPT auth snapshots and quota usage from the command line.",
+  "license": "MIT",
+  "type": "module",
+  "homepage": "https://github.com/HOOLC/codex-team#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/HOOLC/codex-team.git"
+  },
+  "bugs": {
+    "url": "https://github.com/HOOLC/codex-team/issues"
+  },
+  "keywords": [
+    "codex",
+    "chatgpt",
+    "cli",
+    "account",
+    "quota"
+  ],
+  "bin": {
+    "codex-team": "dist/cli.js",
+    "codexm": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "LICENSE",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "rslib build",
+    "dev": "rslib build --watch",
+    "docs:readme": "node ./scripts/sync-readme-command-sections.mjs",
+    "prepack": "pnpm build",
+    "test": "node ./scripts/run-tests.cjs",
+    "test:watch": "rstest watch",
+    "typecheck": "tsc --noEmit",
+    "verify": "pnpm typecheck && pnpm test",
+    "verify:full": "pnpm verify && pnpm build"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/",
+    "access": "public"
+  },
+  "devDependencies": {
+    "@rslib/core": "^0.20.0",
+    "@rstest/core": "^0.9.3",
+    "@types/node": "^24.5.2",
+    "@types/ws": "^8.18.1",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.2"
+  },
+  "dependencies": {
+    "dayjs": "^1.11.20",
+    "ws": "^8.18.3"
+  }
+}

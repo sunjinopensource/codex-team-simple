@@ -1,0 +1,14 @@
+node_modules
+dist
+.DS_Store
+coverage
+*.tgz
+*.tsbuildinfo
+.env
+.env.*
+*.log
+*.log.*
+logs
+pnpm-debug.log*
+tests/.tmp-rstest-orphan*.test.ts
+.venv

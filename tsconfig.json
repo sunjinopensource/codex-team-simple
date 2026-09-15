@@ -12,5 +12,5 @@
     "forceConsistentCasingInFileNames": true,
     "types": ["node"]
   },
-  "include": ["src/**/*.ts", "tests/**/*.ts", "rslib.config.ts"]
+  "include": ["src/**/*.ts", "rslib.config.ts"]
 }

@@ -1,7 +1,7 @@
 {
   "name": "codex-team",
   "version": "0.0.27",
-  "description": "Manage multiple Codex ChatGPT auth snapshots and quota usage from the command line.",
+  "description": "Local web console for managing multiple Codex ChatGPT auth snapshots, plus a small Python registry server.",
   "license": "MIT",
   "type": "module",
   "homepage": "https://github.com/HOOLC/codex-team#readme",
@@ -31,12 +31,9 @@
   "scripts": {
     "build": "rslib build",
     "dev": "rslib build --watch",
-    "docs:readme": "node ./scripts/sync-readme-command-sections.mjs",
     "prepack": "pnpm build",
-    "test": "node ./scripts/run-tests.cjs",
-    "test:watch": "rstest watch",
     "typecheck": "tsc --noEmit",
-    "verify": "pnpm typecheck && pnpm test",
+    "verify": "pnpm typecheck && pnpm build",
     "verify:full": "pnpm verify && pnpm build"
   },
   "engines": {

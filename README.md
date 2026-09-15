@@ -37,6 +37,25 @@ http://127.0.0.1:<port>/?token=...
 
 From the console you can add accounts (device-code login, browser-callback login, or API key), switch the active account, re-login accounts whose refresh token was revoked, delete accounts, restart Codex Desktop, and sync with a registry server.
 
+### TOF (OA) login
+
+The console can require an OA login before it serves anything — same TOF4 flow as flaskpang (`views/auth.py`): `/login` redirects to `passport.woa.com`, passport comes back with `?code=...`, the code is exchanged through the RIO-signed TOF4 AccessToken API for `LoginName` / `ChineseName`, and the identity is kept in a signed `HttpOnly` cookie. `/api/*` answers `401 {"need_login": true}` instead of redirecting, so `fetch` never gets an HTML login page.
+
+| Env | Meaning |
+|---|---|
+| `CODEXM_TOF_PAAS_ID` / `PAAS_ID` | OAuth appkey (default `pang_oa_com`) |
+| `CODEXM_TOF_PAAS_TOKEN` / `PAAS_TOKEN` | OAuth token; TOF stays **off** without it |
+| `CODEXM_TOF_SECRET` / `SECRET_KEY` | cookie signing key; random per process when unset (a restart logs everyone out) |
+| `CODEXM_UI_LOGIN_DISABLED` / `LOGIN_DISABLED=1` | force TOF off (local debugging) |
+
+```bash
+export CODEXM_TOF_PAAS_ID=pang_oa_com
+export CODEXM_TOF_PAAS_TOKEN=...
+node dist/cli.js ui
+```
+
+Without a token the console keeps working on its one-shot local token alone, and says so at startup.
+
 ## Run the registry server
 
 ```bash

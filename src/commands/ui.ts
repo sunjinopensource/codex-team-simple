@@ -32,6 +32,17 @@ import {
 import { isTraySupported, startTray, type TrayAction, type TrayHost } from "../tray/index.js";
 import { syncAccountsToRemote } from "./remote.js";
 import {
+  buildPassportSignInUrl,
+  buildPassportSignOutUrl,
+  expiredTofSessionCookie,
+  fetchTofUser,
+  readTofSession,
+  resolveTofConfig,
+  serializeTofSession,
+  tofSessionCookie,
+  type TofConfig,
+} from "../tof-auth.js";
+import {
   resolveRegistryClientId,
   runAutoSyncLoop,
   runAutoSyncOnce,
@@ -102,6 +113,9 @@ function renderPage(): string {
   h1 span { color: var(--muted); font-weight: 400; }
   .meta { color: var(--muted); font-size: 12.5px; }
   .spacer { flex: 1; }
+  .user { color: var(--text); font-size: 12.5px; opacity: .8; }
+  /* !important: buttons/cards define their own display and must still hide. */
+  .hidden { display: none !important; }
   button {
     background: var(--panel-2); color: var(--text); border: 1px solid var(--line);
     border-radius: 8px; padding: 8px 14px; font-size: 13px; cursor: pointer;
@@ -219,10 +233,11 @@ function renderPage(): string {
   <h1>codexm <span>控制台</span></h1>
   <div class="meta" id="meta">加载中…</div>
   <div class="spacer"></div>
+  <span class="user hidden" id="userBox"></span>
+  <button id="logoutBtn" class="hidden">退出登录</button>
   <button id="addBtn" class="primary">添加账号</button>
   <button id="relaunchBtn">重启桌面端</button>
   <button id="refreshBtn">刷新配额</button>
-  <button id="syncBtn">与服务器对齐</button>
   <button id="quitBtn">退出</button>
 </header>
 <div id="banner" class="banner hidden"></div>
@@ -272,7 +287,19 @@ function renderPage(): string {
   const meta = document.getElementById("meta");
   const banner = document.getElementById("banner");
   const toastBox = document.getElementById("toast");
+  const userBox = document.getElementById("userBox");
+  const logoutBtn = document.getElementById("logoutBtn");
   let busy = false;
+  let loginRedirecting = false;
+
+  // The page polls every 5s, so an expired session must trigger exactly one
+  // navigation instead of one per in-flight request.
+  function goLogin() {
+    if (loginRedirecting) return;
+    loginRedirecting = true;
+    window.location.href = "/login?token=" + encodeURIComponent(token) +
+      "&next=" + encodeURIComponent(window.location.pathname + window.location.search);
+  }
 
   function toast(message, kind) {
     const node = document.createElement("div");
@@ -296,6 +323,10 @@ function renderPage(): string {
       body: body ? JSON.stringify(body) : undefined,
     }).then(async function (response) {
       const payload = await response.json().catch(() => ({}));
+      if (response.status === 401 && payload.need_login) {
+        goLogin();
+        throw new Error("登录态已过期，正在跳转 OA 登录…");
+      }
       if (!response.ok) {
         throw new Error(payload.error || ("请求失败（" + response.status + "）"));
       }
@@ -376,6 +407,13 @@ function renderPage(): string {
     const sync = state.sync || {};
     const offline = sync.offline === true;
     renderBanner(state);
+    if (state.user) {
+      userBox.textContent = state.user.chinese_name
+        ? state.user.login_name + "（" + state.user.chinese_name + "）"
+        : state.user.login_name;
+      userBox.classList.remove("hidden");
+      logoutBtn.classList.remove("hidden");
+    }
     meta.textContent = accounts.length + " 个账号 · " +
       (state.remote ? "registry " + state.remote.name + "（" + (state.remote.accounts || []).length + " 个）" : "未配置 registry") +
       (sync.last_success_at ? " · 上次同步 " + timeAgo(sync.last_success_at) : "") +
@@ -574,9 +612,9 @@ function renderPage(): string {
   document.getElementById("refreshBtn").addEventListener("click", function () {
     act("/api/refresh", {}, "配额已刷新");
   });
-  document.getElementById("syncBtn").addEventListener("click", function () {
-    act("/api/sync", {}, "同步完成");
-  });
+  // No "align with server" button: the console runs the registry pass itself
+  // (every AUTO_SYNC_INTERVAL_MS, starting at launch), so the page only reports
+  // its result.
   const addModal = document.getElementById("addModal");
   const addName = document.getElementById("addName");
   const addMethod = document.getElementById("addMethod");
@@ -941,6 +979,10 @@ function renderPage(): string {
     submitAdd(false);
   });
 
+  logoutBtn.addEventListener("click", function () {
+    window.location.href = "/logout?token=" + encodeURIComponent(token);
+  });
+
   document.getElementById("quitBtn").addEventListener("click", async function () {
     try { await api("/api/quit", "POST", {}); } catch (error) { /* server is gone */ }
     document.body.innerHTML = '<div class="empty">控制台已停止，可以关闭此标签页。</div>';
@@ -960,6 +1002,32 @@ function sendJson(res: ServerResponse, status: number, payload: unknown): void {
     "cache-control": "no-store",
   });
   res.end(body);
+}
+
+function redirectTo(
+  res: ServerResponse,
+  location: string,
+  extraHeaders?: Record<string, string>,
+): void {
+  res.writeHead(302, { location, "cache-control": "no-store", ...extraHeaders });
+  res.end();
+}
+
+/** Only same-site absolute paths survive, so ?next= cannot become an open redirect. */
+function safeNextPath(value: string | null): string {
+  if (!value || !value.startsWith("/") || value.startsWith("//")) {
+    return "/";
+  }
+  return value;
+}
+
+function withToken(path: string, token: string): string {
+  return `${path}${path.includes("?") ? "&" : "?"}token=${encodeURIComponent(token)}`;
+}
+
+/** passport needs an absolute callback the browser can reach: same host the console runs on. */
+function requestOrigin(req: IncomingMessage): string {
+  return `http://${req.headers.host ?? "127.0.0.1"}`;
 }
 
 async function readJsonBody(req: IncomingMessage): Promise<Record<string, unknown>> {
@@ -1677,6 +1745,9 @@ export async function handleUiCommand(options: {
 }): Promise<number> {
   const { store, stdout } = options;
   const accountAddFlows = options.accountAddFlows ?? createAccountAddFlows();
+  // Session key lives in the same config dir as the rest of the state, so the
+  // login survives a restart instead of expiring with the process.
+  const tof: TofConfig = resolveTofConfig(store.paths.codexTeamDir);
 
   let requestedPort = 0;
   if (options.portOption) {
@@ -1704,6 +1775,68 @@ export async function handleUiCommand(options: {
       }
 
       try {
+        // TOF identity lives in a signed cookie, so every request is checked
+        // on its own: no session store to lose when the console restarts.
+        const sessionUser = tof.enabled ? readTofSession(tof, req.headers.cookie) : null;
+
+        if (tof.enabled && req.method === "GET" && url.pathname === "/login") {
+          const next = safeNextPath(url.searchParams.get("next"));
+          if (sessionUser) {
+            redirectTo(res, withToken(next, token));
+            return;
+          }
+
+          const code = url.searchParams.get("code");
+          if (!code) {
+            // Stage 1: hand the browser over to OA; passport comes back with ?code=.
+            const callback = `${requestOrigin(req)}/login?token=${encodeURIComponent(token)}`;
+            redirectTo(res, buildPassportSignInUrl(tof, callback));
+            return;
+          }
+
+          try {
+            const user = await fetchTofUser(tof, code);
+            options.debugLog?.(`ui: tof login ${user.login_name}(${user.chinese_name})`);
+            redirectTo(res, withToken(next, token), {
+              "set-cookie": tofSessionCookie(serializeTofSession(tof, user)),
+            });
+          } catch (error) {
+            sendJson(res, 502, {
+              ok: false,
+              need_login: true,
+              error: `TOF 登录失败：${(error as Error).message}`,
+            });
+          }
+          return;
+        }
+
+        if (tof.enabled && req.method === "GET" && url.pathname === "/logout") {
+          // Local session first, then OA's, so the next visit asks for the account.
+          const callback = `${requestOrigin(req)}/login?token=${encodeURIComponent(token)}`;
+          redirectTo(res, buildPassportSignOutUrl(tof, callback), {
+            "set-cookie": expiredTofSessionCookie(),
+          });
+          return;
+        }
+
+        if (tof.enabled && !sessionUser) {
+          // fetch() must never receive the login redirect as HTML.
+          if (url.pathname.startsWith("/api/")) {
+            sendJson(res, 401, {
+              ok: false,
+              need_login: true,
+              error: "未登录或登录态已过期，请刷新页面重新登录",
+            });
+          } else {
+            redirectTo(
+              res,
+              `/login?token=${encodeURIComponent(token)}` +
+                `&next=${encodeURIComponent(url.pathname + url.search)}`,
+            );
+          }
+          return;
+        }
+
         if (req.method === "GET" && url.pathname === "/") {
           res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" });
           res.end(renderPage());
@@ -1711,7 +1844,7 @@ export async function handleUiCommand(options: {
         }
 
         if (req.method === "GET" && url.pathname === "/api/state") {
-          sendJson(res, 200, await buildState(store, syncStatus));
+          sendJson(res, 200, { ...(await buildState(store, syncStatus)), user: sessionUser });
           return;
         }
 
@@ -2000,6 +2133,11 @@ export async function handleUiCommand(options: {
 
   process.once("SIGINT", shutdown);
   stdout.write(`codexm 控制台已启动：${url}\n`);
+  stdout.write(
+    tof.enabled
+      ? `TOF 登录已启用（appkey ${tof.paasId}）：打开控制台需先通过 OA 登录。\n`
+      : "TOF 登录未启用：设置 CODEXM_TOF_PAAS_ID / CODEXM_TOF_PAAS_TOKEN（或 PAAS_ID / PAAS_TOKEN）后生效，当前仅校验本机一次性 token。\n",
+  );
 
   if (options.tray === true && !wantsTray) {
     stdout.write("托盘图标仅在 Windows 上可用，已按普通模式运行。\n");

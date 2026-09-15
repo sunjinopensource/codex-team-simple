@@ -129,6 +129,18 @@ if (-not $Force) {
 # survives); it auto-closes instead of delaying the actual start.
 Show-Popup -Message "正在启动 codexm 控制台，托盘区稍后会出现蓝色 C 图标，左键单击即可打开控制台。" -Seconds 3 -Icon 64
 
+<#
+TOF (OA) 登录凭据：与 pang.oa.com / flaskpang 共用的 OAuth 应用，明文内置在
+这里，双击即可用（与 flaskpang 的做法一致）。外部已设置同名环境变量时以其
+为准，所以换用自己的 OAuth 应用或临时关闭登录都不用改本文件。
+#>
+if (-not $env:CODEXM_TOF_PAAS_ID -and -not $env:PAAS_ID) {
+    $env:CODEXM_TOF_PAAS_ID = 'pang_oa_com'
+}
+if (-not $env:CODEXM_TOF_PAAS_TOKEN -and -not $env:PAAS_TOKEN) {
+    $env:CODEXM_TOF_PAAS_TOKEN = '8A1775EDA7EC4287AFDAB40348D1A8F0'
+}
+
 $cliPath = Resolve-CliPath $Cli
 $nodePath = Resolve-NodePath $Node
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'

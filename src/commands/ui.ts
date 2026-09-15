@@ -41,6 +41,9 @@ import {
 
 type DebugLogger = (message: string) => void;
 
+/** Give the server this long to stop on its own before forcing the exit. */
+const FORCE_EXIT_DELAY_MS = 2_000;
+
 /**
  * Sync health for the page: it has to tell "本地就是服务器的数据" apart from
  * "服务器连不上，看到的是本机旧数据".
@@ -1933,7 +1936,23 @@ export async function handleUiCommand(options: {
     stopAutoSync?.();
     accountAddFlows.cancelAll();
     trayHost?.stop();
+
+    // A console tab polls every few seconds, so its keep-alive socket is never
+    // idle: close() alone would wait forever and node would outlive the tray
+    // as a process that can no longer serve a single request.
+    try {
+      server.closeAllConnections();
+    } catch {
+      // Not listening (or already closed): there is nothing to sever.
+    }
     server.close(() => resolveClosed?.());
+
+    // Last resort: whatever handle is still open, do not linger as a zombie
+    // that start-tray.ps1 still counts as a running instance.
+    setTimeout(() => {
+      stdout.write("控制台未能干净退出，已强制结束。\n");
+      process.exit(0);
+    }, FORCE_EXIT_DELAY_MS).unref();
   }
 
   await new Promise<void>((resolve, reject) => {

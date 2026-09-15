@@ -94,21 +94,33 @@ function Resolve-NodePath {
 }
 
 if (-not $Force) {
-    $existing = @(Get-CimInstance Win32_Process -Filter "Name='node.exe'" -ErrorAction SilentlyContinue |
-        Where-Object { $_.CommandLine -match 'codex-team' -and $_.CommandLine -match 'ui' -and $_.CommandLine -match '--tray' })
+    # A listening port is the only proof an instance can actually serve. A
+    # node.exe that lost its tray and is still winding down keeps matching the
+    # command-line check below while being unable to answer a single request,
+    # which made the launcher report a phantom instance forever.
+    $listener = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($listener) {
+        $owner = Get-CimInstance Win32_Process -Filter "ProcessId = $($listener.OwningProcess)" -ErrorAction SilentlyContinue
+        if ($owner -and $owner.Name -eq 'node.exe' -and $owner.CommandLine -match 'codex-team') {
+            $message = "已有 codexm 控制台在运行（端口 $Port，pid $($listener.OwningProcess)）：http://127.0.0.1:${Port}/ 。加 -Force 可以再起一个。"
+            Write-Host $message -ForegroundColor Yellow
+            # The running instance does not re-announce itself, so the double-click
+            # would be silent. It is already up: just say so.
+            Show-Popup -Message $message -Seconds 8 -Icon 64
+            exit 0
+        }
 
-    if ($existing.Count -gt 0) {
-        $message = "已有 codexm 托盘实例在运行（pid：$($existing.ProcessId -join '、')）。加 -Force 可以再起一个。"
-        Write-Host $message -ForegroundColor Yellow
-        # The running instance does not re-announce itself, so the double-click
-        # would be silent. It is already up: just say so.
-        Show-Popup -Message $message -Seconds 8 -Icon 64
-        exit 0
+        $ownerName = if ($owner) { $owner.Name } else { '未知进程' }
+        throw "端口 $Port 已被其他进程占用（pid $($listener.OwningProcess)，$ownerName）。换个 -Port，或加 -Force 强制启动。"
     }
 
-    $busy = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($busy) {
-        throw "端口 $Port 已被占用（pid $($busy.OwningProcess)）。换个 -Port，或加 -Force 强制启动。"
+    # No listener but a matching process: a console that lost its tray, or one
+    # still closing. It cannot serve, so say so and start a fresh instance.
+    $stale = @(Get-CimInstance Win32_Process -Filter "Name='node.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -match 'codex-team' -and $_.CommandLine -match 'ui' -and $_.CommandLine -match '--tray' })
+    if ($stale.Count -gt 0) {
+        $note = "发现残留的 codexm 进程（pid：$($stale.ProcessId -join '、')），它已不再监听 $Port，将继续启动新实例。"
+        Write-Host $note -ForegroundColor Yellow
     }
 }
 

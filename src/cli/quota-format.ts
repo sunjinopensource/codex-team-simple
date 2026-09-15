@@ -1,7 +1,6 @@
 import { formatAccountListDisplayName, formatAccountListMarkers } from "../account-list-display.js";
 import { maskAccountId } from "../auth-snapshot.js";
 import type { AccountQuotaSummary } from "../account-store/index.js";
-import type { ProxyQuotaAggregate } from "../proxy/quota.js";
 import type { WatchHistoryEtaContext } from "../watch/history.js";
 import {
   colorizeBlockedRow,
@@ -25,7 +24,7 @@ import {
   visibleWidth,
 } from "./quota-display.js";
 import { buildListSummary } from "./quota-summary.js";
-import { rankListCandidates, selectCurrentNextResetWindow, toDisplayAutoSwitchCandidate } from "./quota-ranking.js";
+import { rankListCandidates, selectCurrentNextResetWindow, toAutoSwitchCandidate } from "./quota-ranking.js";
 import { PROXY_ACCOUNT_ID, PROXY_ACCOUNT_NAME } from "../proxy/constants.js";
 import type {
   AutoSwitchCandidate,
@@ -495,7 +494,6 @@ function describeQuotaAccounts(
     daemonFeatureLine?: string | null;
     proxyLastUpstreamLine?: string | null;
     proxyLastUpstreamAccountName?: string | null;
-    proxyAggregate?: ProxyQuotaAggregate | null;
     summaryAccounts?: AccountQuotaSummary[];
   } = {},
 ): string {
@@ -521,7 +519,7 @@ function describeQuotaAccounts(
   const rankedCandidates = rankListCandidates(accounts);
   const autoSwitchCandidates = new Map(
     accounts
-      .map((account) => toDisplayAutoSwitchCandidate(account, options.proxyAggregate))
+      .map((account) => toAutoSwitchCandidate(account))
       .filter((candidate): candidate is AutoSwitchCandidate => candidate !== null)
       .map((candidate) => [candidate.name, candidate] as const),
   );
@@ -551,7 +549,7 @@ function describeQuotaAccounts(
   const displayRows = orderedAccounts.map((account) => {
     const candidate = autoSwitchCandidates.get(account.name);
     const eta = toQuotaEtaSummary(options.etaByName?.get(account.name));
-    const currentScore = candidate ? normalizeAccountScore(candidate.current_score, account, options.proxyAggregate) : null;
+    const currentScore = candidate ? normalizeAccountScore(candidate.current_score, account) : null;
     const nextResetAt = candidate
       ? formatResetAt(selectCurrentNextResetWindow(account, candidate))
       : "-";
@@ -588,7 +586,7 @@ function describeQuotaAccounts(
       row.projected5hIn1wUnits1h = candidate
         ? formatRawScore(candidate.projected_5h_in_1w_units_1h)
         : "-";
-      const score1h = candidate ? normalizeAccountScore(candidate.score_1h, account, options.proxyAggregate) : null;
+      const score1h = candidate ? normalizeAccountScore(candidate.score_1h, account) : null;
       row.score1h = candidate
         ? colorizeScore(formatRemainingPercent(score1h), score1h)
         : "-";
@@ -782,7 +780,6 @@ export function describeQuotaRefresh(
     daemonFeatureLine?: string | null;
     proxyLastUpstreamLine?: string | null;
     proxyLastUpstreamAccountName?: string | null;
-    proxyAggregate?: ProxyQuotaAggregate | null;
     summaryAccounts?: AccountQuotaSummary[];
   } = {},
 ): string {

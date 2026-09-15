@@ -4,8 +4,6 @@ import utc from "dayjs/plugin/utc.js";
 
 import type { AccountQuotaSummary } from "../account-store/index.js";
 import { normalizeDisplayedScore } from "../plan-quota-profile.js";
-import { PROXY_ACCOUNT_ID } from "../proxy/constants.js";
-import type { ProxyQuotaAggregate } from "../proxy/quota.js";
 import type { WatchHistoryEtaContext } from "../watch/history.js";
 import { computeAvailability } from "./quota-core.js";
 import { rankListCandidates } from "./quota-ranking.js";
@@ -260,23 +258,10 @@ export function normalizePlusScore(value: number | null, planType: string | null
 
 export function normalizeAccountScore(
   value: number | null,
-  account: Pick<AccountQuotaSummary, "account_id" | "plan_type">,
-  proxyAggregate: ProxyQuotaAggregate | null | undefined = null,
+  account: Pick<AccountQuotaSummary, "plan_type">,
 ): number | null {
   if (value === null) {
     return null;
-  }
-
-  if (account.account_id === PROXY_ACCOUNT_ID && proxyAggregate) {
-    const oneWeekCapacityInPlusUnits = proxyAggregate.displayProfile.oneWeekCapacityInPlusUnits;
-    const fiveHourToOneWeekRawRatio = proxyAggregate.displayProfile.fiveHourToOneWeekRawRatio;
-    if (
-      oneWeekCapacityInPlusUnits !== null
-      && oneWeekCapacityInPlusUnits > 0
-      && fiveHourToOneWeekRawRatio !== null
-    ) {
-      return Number(((value / oneWeekCapacityInPlusUnits) * fiveHourToOneWeekRawRatio).toFixed(2));
-    }
   }
 
   return normalizePlusScore(value, account.plan_type);

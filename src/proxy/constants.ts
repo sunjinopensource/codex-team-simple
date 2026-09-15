@@ -9,8 +9,6 @@ export const PROXY_MODEL_PROVIDER_NAME = "codexm_proxy";
 export const DEFAULT_PROXY_HOST = "127.0.0.1";
 export const DEFAULT_PROXY_PORT = 14555;
 export const PROXY_PORT_ENV_VAR = "CODEXM_PROXY_PORT";
-export const CHATGPT_UPSTREAM_BASE_URL = "https://chatgpt.com";
-export const OPENAI_UPSTREAM_BASE_URL = "https://api.openai.com/v1";
 
 export function isReservedProxyAccountName(value: string | null | undefined): boolean {
   return typeof value === "string" && value.trim().toLowerCase() === PROXY_ACCOUNT_NAME;

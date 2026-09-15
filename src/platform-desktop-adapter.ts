@@ -359,44 +359,104 @@ function parseWindowsProcessList(stdout: string): RunningCodexDesktop[] {
   return running;
 }
 
-async function quitRunningAppsW32(
+const DESKTOP_QUIT_POLL_INTERVAL_MS = 150;
+const DESKTOP_GRACEFUL_QUIT_TIMEOUT_MS = 4_000;
+const DESKTOP_FORCE_QUIT_TIMEOUT_MS = 3_000;
+
+/**
+ * Windows liveness probe with no subprocess cost. Polling through PowerShell
+ * costs ~350 ms per round, which dominated the wait while a dozen Electron
+ * processes wind down.
+ */
+function isWindowsPidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    // EPERM: the process exists but this session may not query it.
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+async function taskkillDesktopPids(
   execFileImpl: ExecFileLike,
-  options?: { force?: boolean },
+  pids: readonly number[],
+  force: boolean,
 ): Promise<void> {
-  let running = await listRunningAppsW32(execFileImpl);
-  if (running.length === 0) {
+  if (pids.length === 0) {
     return;
   }
 
   // `taskkill /T` also tears down the Electron child processes.
-  for (const app of running) {
-    const args = options?.force === true
-      ? ["/PID", String(app.pid), "/T", "/F"]
-      : ["/PID", String(app.pid), "/T"];
+  const flags = force ? ["/F", "/T"] : ["/T"];
+
+  try {
+    await execFileImpl("taskkill", [...pids.flatMap((pid) => ["/PID", String(pid)]), ...flags]);
+    return;
+  } catch {
+    // A stale pid fails the whole call, so retry per pid to make sure the
+    // survivors still get their close signal.
+  }
+
+  for (const pid of pids) {
     try {
-      await execFileImpl("taskkill", args);
+      await execFileImpl("taskkill", ["/PID", String(pid), ...flags]);
     } catch {
       // Process already gone or not owned by this session.
     }
   }
+}
 
-  for (let attempt = 0; attempt < 20; attempt += 1) {
-    running = await listRunningAppsW32(execFileImpl);
-    if (running.length === 0) {
-      return;
+async function waitForWindowsPidsToExit(
+  pids: readonly number[],
+  timeoutMs: number,
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+
+  for (;;) {
+    if (!pids.some(isWindowsPidAlive)) {
+      return true;
     }
 
-    await new Promise((resolve) => setTimeout(resolve, 300));
+    if (Date.now() >= deadline) {
+      return false;
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, DESKTOP_QUIT_POLL_INTERVAL_MS));
+  }
+}
+
+async function quitRunningAppsW32(
+  execFileImpl: ExecFileLike,
+  options?: { force?: boolean },
+): Promise<void> {
+  const running = await listRunningAppsW32(execFileImpl);
+  if (running.length === 0) {
+    return;
   }
 
-  if (options?.force !== true) {
+  const force = options?.force === true;
+  const pids = running.map((app) => app.pid);
+
+  // One taskkill for the whole tree: killing a dozen Electron processes one
+  // subprocess at a time delayed the close request itself by seconds.
+  await taskkillDesktopPids(execFileImpl, pids, force);
+
+  const exited = await waitForWindowsPidsToExit(
+    pids,
+    force ? DESKTOP_FORCE_QUIT_TIMEOUT_MS : DESKTOP_GRACEFUL_QUIT_TIMEOUT_MS,
+  );
+  if (exited) {
+    return;
+  }
+
+  // A graceful close that will not finish must not stall the restart: the
+  // caller falls back to a forced kill (and warns) when this rejects.
+  if (!force) {
     throw new Error("Timed out waiting for Codex Desktop to quit.");
   }
 
-  const remaining = await listRunningAppsW32(execFileImpl);
-  if (remaining.length > 0) {
-    throw new Error("Timed out waiting for Codex Desktop to terminate.");
-  }
+  throw new Error("Timed out waiting for Codex Desktop to terminate.");
 }
 
 async function activateDesktopAppW32(

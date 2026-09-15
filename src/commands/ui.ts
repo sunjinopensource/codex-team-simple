@@ -117,7 +117,11 @@ function renderPage(): string {
   h1 span { color: var(--muted); font-weight: 400; }
   .meta { color: var(--muted); font-size: 12.5px; }
   .spacer { flex: 1; }
-  .user { color: var(--text); font-size: 12.5px; opacity: .8; }
+  /* Signed-in user sits at the far right and owns the account menu. */
+  .user-menu { position: relative; }
+  .user-menu.hidden { display: none; }
+  .user-trigger { font-size: 12.5px; padding: 8px 12px; }
+  .user-menu .menu { top: calc(100% + 8px); right: 0; }
   /* !important: buttons/cards define their own display and must still hide. */
   .hidden { display: none !important; }
   button {
@@ -195,6 +199,7 @@ function renderPage(): string {
   .badge.live { color: var(--ok); border-color: rgba(63,185,80,.4); }
   .badge.hot { color: var(--hot); border-color: rgba(255,86,86,.45); }
   .sub { color: var(--muted); font-size: 12px; margin-top: 2px; }
+  .sub .owner { color: var(--text); font-weight: 600; }
   .meters { margin: 16px 0 14px; display: grid; gap: 12px; }
   .meter-label { display: flex; justify-content: space-between; font-size: 12px; color: var(--muted); margin-bottom: 5px; }
   .track { height: 7px; background: #0c121c; border-radius: 999px; overflow: hidden; }
@@ -256,12 +261,15 @@ function renderPage(): string {
   <div class="meta" id="meta">加载中…</div>
   <button class="chip hidden" id="presenceSummary" title="查看当前使用者"></button>
   <div class="spacer"></div>
-  <span class="user hidden" id="userBox"></span>
-  <button id="logoutBtn" class="hidden">退出登录</button>
   <button id="addBtn" class="primary">添加账号</button>
   <button id="relaunchBtn">重启桌面端</button>
   <button id="refreshBtn">刷新配额</button>
-  <button id="quitBtn">退出</button>
+  <div class="user-menu hidden" id="userMenu">
+    <button class="user-trigger" id="userBox" aria-haspopup="true" aria-expanded="false" title="账号菜单"></button>
+    <div class="menu hidden" id="userDropdown">
+      <button class="menu-item" id="logoutBtn">退出登录</button>
+    </div>
+  </div>
 </header>
 <div id="banner" class="banner hidden"></div>
 <main id="grid"></main>
@@ -321,7 +329,9 @@ function renderPage(): string {
   const meta = document.getElementById("meta");
   const banner = document.getElementById("banner");
   const toastBox = document.getElementById("toast");
+  const userMenu = document.getElementById("userMenu");
   const userBox = document.getElementById("userBox");
+  const userDropdown = document.getElementById("userDropdown");
   const logoutBtn = document.getElementById("logoutBtn");
   const presenceModal = document.getElementById("presenceModal");
   const presenceSub = document.getElementById("presenceSub");
@@ -454,8 +464,7 @@ function renderPage(): string {
       userBox.textContent = state.user.chinese_name
         ? state.user.login_name + "（" + state.user.chinese_name + "）"
         : state.user.login_name;
-      userBox.classList.remove("hidden");
-      logoutBtn.classList.remove("hidden");
+      userMenu.classList.remove("hidden");
     }
     meta.textContent = accounts.length + " 个账号 · " +
       (state.remote ? "registry " + state.remote.name + "（" + (state.remote.accounts || []).length + " 个）" : "未配置 registry") +
@@ -496,6 +505,7 @@ function renderPage(): string {
           '</div>' +
         '</div>' +
         '<div class="sub">' + esc(plan) + ' · ' + esc(account.account_id || "无账号 ID") +
+          (account.owner ? ' · 创建者 <b class="owner">' + esc(account.owner) + '</b>' : "") +
           (blocked && errorText ? " · " + esc(errorText) : "") +
           (offline ? " · 服务器不可达，这是本机数据" : syncState ? " · " + syncState : "") + '</div>' +
         '<div class="meters">' +
@@ -1109,8 +1119,31 @@ function renderPage(): string {
     submitAdd(false);
   });
 
+  function setUserMenuOpen(open) {
+    userDropdown.classList.toggle("hidden", !open);
+    userBox.setAttribute("aria-expanded", open ? "true" : "false");
+  }
+
+  userBox.addEventListener("click", function (event) {
+    event.stopPropagation();
+    setUserMenuOpen(userDropdown.classList.contains("hidden"));
+  });
+
   logoutBtn.addEventListener("click", function () {
     window.location.href = "/logout?token=" + encodeURIComponent(token);
+  });
+
+  // Clicking anywhere else closes the menu, the same as the card menus.
+  document.addEventListener("click", function (event) {
+    if (!userMenu.contains(event.target)) {
+      setUserMenuOpen(false);
+    }
+  });
+
+  document.addEventListener("keydown", function (event) {
+    if (event.key === "Escape") {
+      setUserMenuOpen(false);
+    }
   });
 
   document.getElementById("presenceCloseBtn").addEventListener("click", function () {
@@ -1121,11 +1154,6 @@ function renderPage(): string {
   });
   presenceSummaryBtn.addEventListener("click", function () {
     showPresence(null);
-  });
-
-  document.getElementById("quitBtn").addEventListener("click", async function () {
-    try { await api("/api/quit", "POST", {}); } catch (error) { /* server is gone */ }
-    document.body.innerHTML = '<div class="empty">控制台已停止，可以关闭此标签页。</div>';
   });
 
   reload();
@@ -1207,6 +1235,7 @@ async function buildState(
       name: account.name,
       auth_mode: account.auth_mode,
       account_id: account.account_id,
+      owner: account.owner ?? null,
       current: currentNames.has(account.name),
       updated_at: account.updated_at,
       quota: account.quota,
@@ -1683,6 +1712,8 @@ export async function performUiAddAccount(options: {
   method: UiAddAccountMethod;
   apiKey?: string;
   force?: boolean;
+  /** Signed-in user who is creating the account; stored as the account owner. */
+  owner?: string | null;
   debugLog?: DebugLogger;
 }): Promise<UiAddAccountResult> {
   const name = options.name.trim();
@@ -1693,6 +1724,9 @@ export async function performUiAddAccount(options: {
   ensureNotReservedProxyAccountName(name, "name a managed account");
 
   const { accounts } = await options.store.listAccounts();
+  // Re-logging into an existing account replaces its tokens, not its owner:
+  // whoever added it first stays on record.
+  const owner = accounts.find((account) => account.name === name)?.owner ?? options.owner ?? null;
   if (accounts.some((account) => account.name === name) && options.force !== true) {
     return {
       status: "confirm-overwrite",
@@ -1708,7 +1742,7 @@ export async function performUiAddAccount(options: {
     const account = await options.store.addAccountSnapshot(
       name,
       { auth_mode: "apikey", OPENAI_API_KEY: apiKey },
-      { force: options.force === true },
+      { force: options.force === true, owner },
     );
     options.debugLog?.(`ui add: saved apikey account ${name}`);
     const registry = await syncWithRegistryAfterChange({
@@ -1733,6 +1767,7 @@ export async function performUiAddAccount(options: {
   ): Promise<{ account: UiAddedAccount; warnings?: string[] }> => {
     const account = await options.store.addAccountSnapshot(name, snapshot, {
       force: options.force === true,
+      owner,
     });
     const registry = await syncWithRegistryAfterChange({
       store: options.store,
@@ -2025,6 +2060,7 @@ export async function handleUiCommand(options: {
               body.method === "apikey" || body.method === "browser" ? body.method : "device",
             apiKey: typeof body.apiKey === "string" ? body.apiKey : undefined,
             force: body.force === true,
+            owner: (sessionUser ?? lastTofUser)?.login_name ?? null,
             debugLog: options.debugLog,
           });
           sendJson(res, 200, {

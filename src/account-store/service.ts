@@ -245,7 +245,11 @@ export class AccountStore {
     };
   }
 
-  async saveCurrentAccount(name: string, force = false): Promise<ManagedAccount> {
+  async saveCurrentAccount(
+    name: string,
+    force = false,
+    options: { owner?: string | null } = {},
+  ): Promise<ManagedAccount> {
     ensureAccountName(name);
     await this.repository.ensureLayout();
 
@@ -302,6 +306,9 @@ export class AccountStore {
     meta.last_switched_at = existingMeta?.last_switched_at ?? null;
     meta.quota = existingMeta?.quota ?? meta.quota;
     meta.last_good_quota = existingMeta?.last_good_quota ?? meta.last_good_quota;
+    // Overwriting an account replaces its login, not its provenance: whoever
+    // added it first stays the owner.
+    meta.owner = options.owner ?? existingMeta?.owner ?? null;
     await atomicWriteFile(
       metaPath,
       stringifyJson(meta),
@@ -316,6 +323,7 @@ export class AccountStore {
     options: {
       force?: boolean;
       rawConfig?: string | null;
+      owner?: string | null;
     } = {},
   ): Promise<ManagedAccount> {
     ensureAccountName(name);
@@ -385,6 +393,8 @@ export class AccountStore {
     meta.auth_refresh_fail_count = 0;
     meta.quota = withoutQuotaFailure(existingMeta?.quota ?? meta.quota);
     meta.last_good_quota = existingMeta?.last_good_quota ?? meta.last_good_quota;
+    // A re-login refreshes the tokens, not the ownership.
+    meta.owner = options.owner ?? existingMeta?.owner ?? null;
     await atomicWriteFile(metaPath, stringifyJson(meta));
 
     return await this.repository.readManagedAccount(name);
@@ -443,6 +453,7 @@ export class AccountStore {
           ),
           last_switched_at: existingMeta.last_switched_at,
           quota: existingMeta.quota,
+          owner: existingMeta.owner ?? null,
         },
       ),
     );

@@ -40,6 +40,8 @@ export interface SnapshotMeta {
   auth_mode: string;
   account_id: string;
   user_id?: string;
+  /** Who added this account to codexm, when the signed-in user was known. */
+  owner?: string | null;
   auto_switch_eligible: boolean;
   created_at: string;
   updated_at: string;
@@ -465,6 +467,7 @@ export function parseSnapshotMeta(raw: string): SnapshotMeta {
     ),
     account_id: asNonEmptyString(parsed.account_id, "account_id"),
     user_id: asOptionalString(parsed.user_id, "user_id"),
+    owner: typeof parsed.owner === "string" && parsed.owner.trim() !== "" ? parsed.owner.trim() : null,
     auto_switch_eligible: asOptionalBoolean(parsed.auto_switch_eligible, "auto_switch_eligible") ?? true,
     created_at: asNonEmptyString(parsed.created_at, "created_at"),
     updated_at: asNonEmptyString(parsed.updated_at, "updated_at"),

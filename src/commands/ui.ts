@@ -18,10 +18,13 @@ import { ensureNotReservedProxyAccountName } from "../proxy/constants.js";
 import { resolveManagedDesktopApiBaseUrl } from "../proxy/runtime.js";
 import {
   deleteRemoteAccount,
+  listAllPresence,
+  listPresence,
   listRemoteAccounts,
   readRemotesFile,
   resolveRemote,
 } from "../registry/client.js";
+import { startPresenceHeartbeat, type PresenceHeartbeat } from "../registry/presence.js";
 import {
   describeBusySwitchLock,
   refreshManagedDesktopAfterSwitch,
@@ -41,6 +44,7 @@ import {
   serializeTofSession,
   tofSessionCookie,
   type TofConfig,
+  type TofUser,
 } from "../tof-auth.js";
 import {
   resolveRegistryClientId,
@@ -166,6 +170,24 @@ function renderPage(): string {
   .menu-item.danger { color: #ff9a9a; }
   .menu-item.danger:hover { background: rgba(255,86,86,.16); }
   .menu-item.danger.armed { background: var(--hot); color: #20090a; font-weight: 600; }
+  .presence-list { display: grid; gap: 8px; max-height: 300px; overflow: auto; margin-top: 4px; }
+  .presence-item {
+    display: flex; align-items: baseline; gap: 10px;
+    padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px;
+    background: var(--panel);
+  }
+  .presence-item .who { font-weight: 600; }
+  .presence-item .host { color: var(--muted); font-size: 12px; }
+  .presence-item .since { margin-left: auto; color: var(--muted); font-size: 12px; }
+  .presence-group { display: grid; gap: 6px; }
+  .presence-group-name { color: var(--muted); font-size: 12px; margin-top: 6px; }
+  /* Headcount in the header: alive only when someone is actually connected. */
+  .chip {
+    font-size: 12px; padding: 4px 10px; border-radius: 999px;
+    border: 1px solid rgba(63,185,80,.4); color: var(--ok); background: rgba(63,185,80,.1);
+  }
+  .chip.hidden { display: none; }
+  .chip:hover { border-color: var(--ok); }
   .badge {
     font-size: 11px; padding: 2px 8px; border-radius: 999px;
     border: 1px solid var(--line); color: var(--muted); text-transform: uppercase; letter-spacing: .4px;
@@ -232,6 +254,7 @@ function renderPage(): string {
 <header>
   <h1>codexm <span>控制台</span></h1>
   <div class="meta" id="meta">加载中…</div>
+  <button class="chip hidden" id="presenceSummary" title="查看当前使用者"></button>
   <div class="spacer"></div>
   <span class="user hidden" id="userBox"></span>
   <button id="logoutBtn" class="hidden">退出登录</button>
@@ -281,6 +304,17 @@ function renderPage(): string {
     </div>
   </div>
 </div>
+<div id="presenceModal" class="modal hidden">
+  <div class="modal-card">
+    <h2>当前使用者</h2>
+    <div class="sub" id="presenceSub"></div>
+    <div class="presence-list" id="presenceList"></div>
+    <div class="modal-actions">
+      <button id="presenceCloseBtn">关闭</button>
+      <button id="presenceRefreshBtn" class="primary">刷新</button>
+    </div>
+  </div>
+</div>
 <script>
   const token = new URLSearchParams(location.search).get("token") || "";
   const grid = document.getElementById("grid");
@@ -289,6 +323,15 @@ function renderPage(): string {
   const toastBox = document.getElementById("toast");
   const userBox = document.getElementById("userBox");
   const logoutBtn = document.getElementById("logoutBtn");
+  const presenceModal = document.getElementById("presenceModal");
+  const presenceSub = document.getElementById("presenceSub");
+  const presenceList = document.getElementById("presenceList");
+  const presenceSummaryBtn = document.getElementById("presenceSummary");
+  let presenceName = "";
+  // Presence arrives in a second request, so the last state is kept around to
+  // redraw the cards once the headcount lands.
+  let presenceSummary = null;
+  let lastState = null;
   let busy = false;
   let loginRedirecting = false;
 
@@ -436,14 +479,19 @@ function renderPage(): string {
       const relogin = !!account.relogin_error;
       const errorText = relogin ? "登录态已失效，请重新登录" : quota.error_message;
       const syncState = syncLabel((sync.actions || {})[account.name]);
+      const users = (presenceSummary && presenceSummary.accounts ? presenceSummary.accounts[account.name] : null) || [];
       return '<div class="card' + (account.current ? " current" : "") + (offline ? " stale" : "") + '">' +
         '<div class="card-top">' +
           '<div class="name">' + esc(account.name) + '</div>' +
           '<div class="badge' + (relogin ? " hot" : account.current ? " live" : "") + '">' +
             esc(relogin ? "需要重新登录" : account.current ? "使用中" : statusLabel) + '</div>' +
+          (users.length
+            ? '<div class="badge live" title="当前使用者">' + users.length + ' 人在用</div>'
+            : "") +
           '<div class="spacer"></div>' +
           '<button class="icon-btn" data-menu="' + esc(account.name) + '" title="更多操作" aria-label="更多操作">⋯</button>' +
           '<div class="menu hidden">' +
+            '<button class="menu-item" data-presence="' + esc(account.name) + '">当前使用者</button>' +
             '<button class="menu-item danger" data-remove="' + esc(account.name) + '">删除账号</button>' +
           '</div>' +
         '</div>' +
@@ -465,13 +513,87 @@ function renderPage(): string {
     }).join("");
   }
 
+  // Who is logged into this account on other machines. The list comes straight
+  // from the registry's heartbeats, so a client that stopped reporting is
+  // already absent — there is no stale "maybe still there" state to explain.
+  function presenceRow(user) {
+    const who = user.chinese_name
+      ? user.login_name + "（" + user.chinese_name + "）"
+      : (user.login_name || user.client_id);
+    return '<div class="presence-item">' +
+      '<span class="who">' + esc(who) + '</span>' +
+      (user.host ? '<span class="host">' + esc(user.host) + '</span>' : "") +
+      '<span class="since">' + (user.since ? "自 " + esc(timeAgo(user.since)) : "") + '</span>' +
+    '</div>';
+  }
+
+  // name === null shows every account at once (the header headcount does this).
+  async function showPresence(name) {
+    const all = !name;
+    presenceName = name || "";
+    presenceSub.textContent = all ? "正在查询当前使用者…" : "正在查询 " + name + " 的使用者…";
+    presenceList.innerHTML = "";
+    presenceModal.classList.remove("hidden");
+    try {
+      if (all) {
+        const payload = await api("/api/presence");
+        const accounts = payload.accounts || {};
+        const names = Object.keys(accounts).sort();
+        presenceSub.textContent = payload.total_users
+          ? "当前共 " + payload.total_users + " 人在使用 " + names.length + " 个账号"
+          : "当前无人使用（客户端下线后会自动从列表移除）";
+        presenceList.innerHTML = names.map(function (accountName) {
+          return '<div class="presence-group">' +
+            '<div class="presence-group-name">' + esc(accountName) + '</div>' +
+            (accounts[accountName] || []).map(presenceRow).join("") +
+          '</div>';
+        }).join("");
+        return;
+      }
+      const payload = await api("/api/accounts/presence?name=" + encodeURIComponent(name));
+      const users = payload.users || [];
+      presenceSub.textContent = users.length
+        ? name + "：" + users.length + " 人在使用"
+        : name + "：当前无人使用（客户端下线后会自动从列表移除）";
+      presenceList.innerHTML = users.map(presenceRow).join("");
+    } catch (error) {
+      presenceSub.textContent = "";
+      presenceList.innerHTML = '<div class="empty">' + esc(error.message) + '</div>';
+    }
+  }
+
+  // The headcount only says something when a registry is configured, so an
+  // unreachable server simply hides the chip instead of showing "0 人在使用".
+  function renderPresenceSummary() {
+    if (!presenceSummary || !presenceSummary.total_users) {
+      presenceSummaryBtn.classList.add("hidden");
+      return;
+    }
+    presenceSummaryBtn.classList.remove("hidden");
+    presenceSummaryBtn.textContent =
+      presenceSummary.total_users + " 人在使用 · " + presenceSummary.accounts_in_use + " 个账号";
+  }
+
+  async function loadPresenceSummary() {
+    try {
+      presenceSummary = await api("/api/presence");
+    } catch {
+      presenceSummary = null;
+    }
+    renderPresenceSummary();
+    // Cards carry a per-account count, so they have to be drawn again.
+    if (lastState) render(lastState);
+  }
+
   async function reload() {
     try {
-      render(await api("/api/state"));
+      lastState = await api("/api/state");
+      render(lastState);
     } catch (error) {
       meta.textContent = "不可用";
       toast(error.message, "error");
     }
+    await loadPresenceSummary();
   }
 
   async function act(path, body, message) {
@@ -548,6 +670,12 @@ function renderPage(): string {
       toggleMenu(menuButton);
       return;
     }
+    const presenceBtn = event.target.closest("button[data-presence]");
+    if (presenceBtn) {
+      closeMenu();
+      showPresence(presenceBtn.getAttribute("data-presence"));
+      return;
+    }
     const remove = event.target.closest("button[data-remove]");
     if (remove) {
       const name = remove.getAttribute("data-remove");
@@ -573,7 +701,9 @@ function renderPage(): string {
   });
 
   document.addEventListener("keydown", function (event) {
-    if (event.key === "Escape") closeMenu();
+    if (event.key !== "Escape") return;
+    closeMenu();
+    presenceModal.classList.add("hidden");
   });
 
   async function relaunchDesktop(allowNonManaged) {
@@ -981,6 +1111,16 @@ function renderPage(): string {
 
   logoutBtn.addEventListener("click", function () {
     window.location.href = "/logout?token=" + encodeURIComponent(token);
+  });
+
+  document.getElementById("presenceCloseBtn").addEventListener("click", function () {
+    presenceModal.classList.add("hidden");
+  });
+  document.getElementById("presenceRefreshBtn").addEventListener("click", function () {
+    showPresence(presenceName || null);
+  });
+  presenceSummaryBtn.addEventListener("click", function () {
+    showPresence(null);
   });
 
   document.getElementById("quitBtn").addEventListener("click", async function () {
@@ -1778,6 +1918,9 @@ export async function handleUiCommand(options: {
         // TOF identity lives in a signed cookie, so every request is checked
         // on its own: no session store to lose when the console restarts.
         const sessionUser = tof.enabled ? readTofSession(tof, req.headers.cookie) : null;
+        if (sessionUser) {
+          lastTofUser = sessionUser;
+        }
 
         if (tof.enabled && req.method === "GET" && url.pathname === "/login") {
           const next = safeNextPath(url.searchParams.get("next"));
@@ -1908,6 +2051,35 @@ export async function handleUiCommand(options: {
           return;
         }
 
+        // Whole registry in one call: the header headcount and the per-card
+        // "N 人在用" badges both read from this.
+        if (req.method === "GET" && url.pathname === "/api/presence") {
+          try {
+            const { config } = await resolveRemote(store);
+            sendJson(res, 200, { ok: true, ...(await listAllPresence(config)) });
+          } catch (error) {
+            sendJson(res, 502, { ok: false, error: (error as Error).message });
+          }
+          return;
+        }
+
+        // Who is using this account right now. Read-only, and only as fresh as
+        // the registry's heartbeats: a client that went away is already gone.
+        if (req.method === "GET" && url.pathname === "/api/accounts/presence") {
+          const name = url.searchParams.get("name") ?? "";
+          if (name === "") {
+            sendJson(res, 400, { error: "缺少账号名称" });
+            return;
+          }
+          try {
+            const { config } = await resolveRemote(store);
+            sendJson(res, 200, { ok: true, users: await listPresence(config, name) });
+          } catch (error) {
+            sendJson(res, 502, { ok: false, error: (error as Error).message });
+          }
+          return;
+        }
+
         if (req.method === "GET" && url.pathname === "/api/accounts/add/status") {
           const flow = accountAddFlows.get(url.searchParams.get("flowId") ?? "");
           if (!flow) {
@@ -2017,6 +2189,10 @@ export async function handleUiCommand(options: {
   let trayHost: TrayHost | null = null;
   let shuttingDown = false;
   let stopAutoSync: (() => void) | null = null;
+  let presence: PresenceHeartbeat | null = null;
+  // The console is per-machine, but the OA user behind it is only known once a
+  // request carried a session cookie — presence reports the latest one.
+  let lastTofUser: TofUser | null = null;
   let lastAutoSync: AutoSyncRunResult | null = null;
 
   // Single source of truth for sync health: both /api/state and /api/autosync
@@ -2067,6 +2243,9 @@ export async function handleUiCommand(options: {
     }
     shuttingDown = true;
     stopAutoSync?.();
+    // Fire and forget: the console is going down, and the server expires the
+    // entry anyway if the goodbye never lands.
+    void presence?.stop();
     accountAddFlows.cancelAll();
     trayHost?.stop();
 
@@ -2125,6 +2304,14 @@ export async function handleUiCommand(options: {
           recordAutoSyncFailure(error);
         },
       });
+
+      // Announce the account in use so the registry can name its users.
+      presence = startPresenceHeartbeat({
+        store,
+        clientId,
+        getUser: () => lastTofUser,
+        debugLog: options.debugLog,
+      });
     }
   } catch (error) {
     syncStatus.last_error = (error as Error).message;
@@ -2137,6 +2324,11 @@ export async function handleUiCommand(options: {
     tof.enabled
       ? `TOF 登录已启用（appkey ${tof.paasId}）：打开控制台需先通过 OA 登录。\n`
       : "TOF 登录未启用：设置 CODEXM_TOF_PAAS_ID / CODEXM_TOF_PAAS_TOKEN（或 PAAS_ID / PAAS_TOKEN）后生效，当前仅校验本机一次性 token。\n",
+  );
+  stdout.write(
+    syncStatus.enabled
+      ? `registry「${syncStatus.remote}」已启用自动对齐：启动即同步一次，之后每 5 分钟一轮。\n`
+      : "未配置 registry 服务器：只显示本机账号。设置 CODEXM_REGISTRY_URL + CODEXM_REGISTRY_TOKEN（或 ~/.codex-team/remotes.json）后自动生效。\n",
   );
 
   if (options.tray === true && !wantsTray) {

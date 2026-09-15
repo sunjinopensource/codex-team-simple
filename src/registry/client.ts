@@ -12,6 +12,14 @@ import {
 const REMOTES_FILE_NAME = "remotes.json";
 
 /**
+ * Name given to the remote built from the environment. It wins over
+ * `default_remote` on purpose: setting CODEXM_REGISTRY_URL is a deliberate
+ * "use this server" switch, and a launcher (start-tray.ps1) can carry it
+ * without writing anything to ~/.codex-team.
+ */
+const ENV_REMOTE_NAME = "env";
+
+/**
  * How long a refresh lease stays valid — long enough for a single OAuth
  * round-trip, short enough that an abandoned one disappears on its own.
  */
@@ -79,7 +87,8 @@ function remotesFilePath(store: AccountStore): string {
   return join(store.paths.codexTeamDir, REMOTES_FILE_NAME);
 }
 
-export async function readRemotesFile(store: AccountStore): Promise<RemotesFile> {
+/** What is actually on disk. Writing back must never persist the env remote. */
+async function readRemotesFileFromDisk(store: AccountStore): Promise<RemotesFile> {
   try {
     const raw = await readFile(remotesFilePath(store), "utf8");
     const parsed = JSON.parse(raw) as Partial<RemotesFile>;
@@ -95,6 +104,30 @@ export async function readRemotesFile(store: AccountStore): Promise<RemotesFile>
   }
 }
 
+function readEnvRemote(): RemoteConfig | null {
+  const url = (process.env.CODEXM_REGISTRY_URL ?? "").trim();
+  if (url === "") {
+    return null;
+  }
+  return { url: url.replace(/\/+$/u, ""), token: (process.env.CODEXM_REGISTRY_TOKEN ?? "").trim() };
+}
+
+/**
+ * Remotes on disk plus the one from the environment, when configured:
+ * CODEXM_REGISTRY_URL (required) and CODEXM_REGISTRY_TOKEN become the "env"
+ * remote and take over as the default.
+ */
+export async function readRemotesFile(store: AccountStore): Promise<RemotesFile> {
+  const data = await readRemotesFileFromDisk(store);
+  const envRemote = readEnvRemote();
+  if (!envRemote) {
+    return data;
+  }
+  data.remotes[ENV_REMOTE_NAME] = envRemote;
+  data.default_remote = ENV_REMOTE_NAME;
+  return data;
+}
+
 async function writeRemotesFile(store: AccountStore, data: RemotesFile): Promise<void> {
   await atomicWriteFile(
     remotesFilePath(store),
@@ -107,7 +140,8 @@ export async function addRemote(
   store: AccountStore,
   options: { name: string; url: string; token: string; setDefault?: boolean },
 ): Promise<void> {
-  const data = await readRemotesFile(store);
+  // Disk-only: the env remote must not be copied into remotes.json.
+  const data = await readRemotesFileFromDisk(store);
   data.remotes[options.name] = {
     url: options.url.replace(/\/+$/u, ""),
     token: options.token,
@@ -119,7 +153,7 @@ export async function addRemote(
 }
 
 export async function removeRemote(store: AccountStore, name: string): Promise<boolean> {
-  const data = await readRemotesFile(store);
+  const data = await readRemotesFileFromDisk(store);
   if (!data.remotes[name]) {
     return false;
   }
@@ -300,6 +334,103 @@ export async function releaseRefreshLease(
 
 export async function deleteRemoteAccount(remote: RemoteConfig, name: string): Promise<void> {
   await request(remote, `/v1/accounts/${encodeURIComponent(name)}`, { method: "DELETE" });
+}
+
+/**
+ * Presence: which client (and which OA user) is logged into an account right
+ * now. The server expires an entry when the heartbeats stop, so a machine that
+ * went away needs no goodbye — but it still sends one when it can, so the list
+ * empties immediately instead of lingering for a TTL.
+ */
+export interface PresenceIdentity {
+  login_name: string;
+  chinese_name: string;
+}
+
+export interface PresenceUser {
+  client_id: string;
+  login_name: string;
+  chinese_name: string;
+  host: string;
+  since: string | null;
+  last_seen: string | null;
+  expires_at: string | null;
+  ttl_ms: number | null;
+}
+
+export const PRESENCE_TTL_MS = 150_000;
+
+function presencePath(name: string): string {
+  return `/v1/accounts/${encodeURIComponent(name)}/presence`;
+}
+
+export async function reportPresence(
+  remote: RemoteConfig,
+  name: string,
+  options: {
+    clientId: string;
+    user?: PresenceIdentity | null;
+    host?: string;
+    ttlMs?: number;
+  },
+): Promise<{ expires_at: string | null }> {
+  const response = await request(remote, presencePath(name), {
+    method: "POST",
+    body: JSON.stringify({
+      client_id: options.clientId,
+      user: options.user ?? {},
+      host: options.host ?? "",
+      ttl_ms: options.ttlMs ?? PRESENCE_TTL_MS,
+    }),
+    headers: { "content-type": "application/json" },
+  });
+  const payload = (await response.json()) as { expires_at?: string };
+  return { expires_at: payload.expires_at ?? null };
+}
+
+export async function clearPresence(
+  remote: RemoteConfig,
+  name: string,
+  options: { clientId: string },
+): Promise<boolean> {
+  const response = await request(remote, presencePath(name), {
+    method: "DELETE",
+    body: JSON.stringify({ client_id: options.clientId }),
+    headers: { "content-type": "application/json" },
+  });
+  const payload = (await response.json()) as { removed?: boolean };
+  return payload.removed === true;
+}
+
+export async function listPresence(
+  remote: RemoteConfig,
+  name: string,
+): Promise<PresenceUser[]> {
+  const response = await request(remote, presencePath(name));
+  const payload = (await response.json()) as { users?: PresenceUser[] };
+  return payload.users ?? [];
+}
+
+/** Every account in use at once — one call instead of one per account. */
+export interface PresenceSummary {
+  accounts: Record<string, PresenceUser[]>;
+  total_users: number;
+  accounts_in_use: number;
+}
+
+export async function listAllPresence(remote: RemoteConfig): Promise<PresenceSummary> {
+  const response = await request(remote, "/v1/presence");
+  const payload = (await response.json()) as {
+    accounts?: Record<string, PresenceUser[]>;
+    total_users?: number;
+    accounts_in_use?: number;
+  };
+  const accounts = payload.accounts ?? {};
+  return {
+    accounts,
+    total_users: payload.total_users ?? 0,
+    accounts_in_use: payload.accounts_in_use ?? Object.keys(accounts).length,
+  };
 }
 
 /**

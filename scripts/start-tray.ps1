@@ -141,6 +141,14 @@ if (-not $env:CODEXM_TOF_PAAS_TOKEN -and -not $env:PAAS_TOKEN) {
     $env:CODEXM_TOF_PAAS_TOKEN = '8A1775EDA7EC4287AFDAB40348D1A8F0'
 }
 
+<#
+registry 服务器（账号以服务器为准的自动对齐目标）。同样明文内置即可，取消
+下面两行注释并填入地址与 <registry-data>\token.txt 的内容；留空则控制台只管
+本机账号。外部已设置同名环境变量时以其为准。
+#>
+$env:CODEXM_REGISTRY_URL = 'http://127.0.0.1:8787'
+$env:CODEXM_REGISTRY_TOKEN = 'Q9wWwzMmuTtYhmAvXS-PQrlqSLpVn6_wJFb1KW8BU7Y'
+
 $cliPath = Resolve-CliPath $Cli
 $nodePath = Resolve-NodePath $Node
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'

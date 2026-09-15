@@ -51,10 +51,23 @@ client's `codexm remote add --token`.
 | PUT | `/v1/accounts/<name>` | upload a bundle; a newer token is never rewound (see below) |
 | GET | `/v1/accounts/<name>/lease` | current refresh lease, if any |
 | POST | `/v1/accounts/<name>/lease` | `acquire` / `renew` / `release` a refresh lease |
-| DELETE | `/v1/accounts/<name>` | remove an account, and any lease it holds |
+| POST | `/v1/accounts/<name>/presence` | heartbeat: "this client is using this account" (body: `client_id`, `user`, `host`, `ttl_ms`) |
+| DELETE | `/v1/accounts/<name>/presence` | best-effort "I stopped using it" (body: `client_id`) |
+| GET | `/v1/accounts/<name>/presence` | who is using it right now |
+| GET | `/v1/presence` | every account in use, with a headcount (de-duplicated by client id) |
+| DELETE | `/v1/accounts/<name>` | remove an account, and any lease or presence it holds |
 | GET | `/v1/audit?limit=100` | recent audit entries |
 
 All `/v1` routes require `Authorization: Bearer <token>`.
+
+### Presence (who is using an account)
+
+Each console heartbeats the managed account it is currently logged into, with
+the OA user behind it. The server keeps those entries in `presence.json` and
+drops any whose heartbeat is older than its TTL (default 150s, so a crashed or
+offline machine disappears on its own); a clean exit also sends `DELETE` so the
+list empties immediately. `GET` therefore answers with live users only — no
+stale entries to explain away.
 
 ### Uploads never rewind a token
 

@@ -12,6 +12,7 @@ Data layout (<data-dir>/):
   accounts/<name>.json   raw share bundle
   index.json             metadata for listing (never contains tokens)
   leases.json            in-flight refresh leases (short TTL)
+  presence.json          who is currently using which account (heartbeat TTL)
   audit.jsonl            who did what, when
   token.txt              bearer token, generated on first run
 
@@ -61,6 +62,7 @@ INDEX = DATA / "index.json"
 AUDIT = DATA / "audit.jsonl"
 TOKEN_FILE = DATA / "token.txt"
 LEASES = DATA / "leases.json"
+PRESENCE = DATA / "presence.json"
 LOCK_FILE = DATA / ".lock"
 
 # Refresh leases are short-lived on purpose: they only need to cover the few
@@ -68,6 +70,13 @@ LOCK_FILE = DATA / ".lock"
 # takeover and fencing logic — an expired lease simply disappears.
 LEASE_TTL_DEFAULT_MS = 120_000
 LEASE_TTL_MAX_MS = 600_000
+
+# Presence is a heartbeat, not a session: clients re-announce the account they
+# are using every minute or so and an entry dies when the heartbeats stop, so
+# a machine that crashed, slept or lost its network drops out of the list
+# without ever sending a goodbye.
+PRESENCE_TTL_DEFAULT_MS = 150_000
+PRESENCE_TTL_MAX_MS = 900_000
 
 # Same pattern the Node client uses for account names (keeps paths safe).
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
@@ -154,6 +163,53 @@ def registry_lock():
             elif msvcrt is not None:
                 handle.seek(0)
                 msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+
+
+def load_presence() -> dict:
+    """{account: {client_id: presence entry}} — written by the heartbeat route."""
+    if not PRESENCE.exists():
+        return {}
+    try:
+        data = json.loads(PRESENCE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_presence(presence: dict) -> None:
+    tmp = PRESENCE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(presence, indent=2), encoding="utf-8")
+    os.replace(tmp, PRESENCE)
+
+
+def prune_presence(presence: dict) -> dict:
+    """Drop holders whose heartbeat went stale, in place.
+
+    This is what removes an offline client: nothing has to tell the server the
+    machine went away — the next reader (or heartbeat) simply forgets it.
+    """
+    now = time.time()
+    for name in list(presence):
+        holders = presence[name]
+        if not isinstance(holders, dict):
+            presence.pop(name, None)
+            continue
+        for client_id in list(holders):
+            entry = holders[client_id]
+            expires = entry.get("expires_at_epoch") if isinstance(entry, dict) else None
+            if not isinstance(expires, (int, float)) or expires <= now:
+                holders.pop(client_id, None)
+        if not holders:
+            presence.pop(name, None)
+    return presence
+
+
+def clamp_ttl_ms(value: object, default: int, maximum: int) -> int:
+    try:
+        ttl_ms = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+    return max(1_000, min(ttl_ms, maximum))
 
 
 def load_leases() -> dict:
@@ -443,6 +499,123 @@ def lease_account(name: str):
         )
 
 
+@app.post("/v1/accounts/<name>/presence")
+def report_presence(name: str):
+    """Heartbeat: "this client is logged into this account right now".
+
+    The entry carries the OA user behind the console, which is what turns the
+    registry into an answer for "who is using this account?".
+    """
+    if not NAME_RE.match(name):
+        abort(400, description="invalid account name")
+    body = request.get_json(force=True, silent=True)
+    if not isinstance(body, dict):
+        return jsonify(error="invalid body: expected a JSON object"), 400
+
+    client_id = str(body.get("client_id") or "").strip()
+    if client_id == "" or len(client_id) > 128:
+        return jsonify(error="client_id is required (1-128 chars)"), 400
+
+    user = body.get("user") if isinstance(body.get("user"), dict) else {}
+    ttl_ms = clamp_ttl_ms(body.get("ttl_ms"), PRESENCE_TTL_DEFAULT_MS, PRESENCE_TTL_MAX_MS)
+
+    with registry_lock():
+        presence = prune_presence(load_presence())
+        holders = presence.setdefault(name, {})
+        previous = holders.get(client_id)
+        previous = previous if isinstance(previous, dict) else {}
+        expires = time.time() + ttl_ms / 1000.0
+        entry = {
+            "client_id": client_id,
+            "login_name": str(user.get("login_name") or "")[:128],
+            "chinese_name": str(user.get("chinese_name") or "")[:128],
+            "host": str(body.get("host") or "")[:128],
+            # First heartbeat of a session, so "已使用" survives a renewal.
+            "since": previous.get("since") or now_iso(),
+            "last_seen": now_iso(),
+            "expires_at": epoch_to_iso(expires),
+            "expires_at_epoch": expires,
+            "ttl_ms": ttl_ms,
+        }
+        holders[client_id] = entry
+        save_presence(presence)
+
+    audit("presence.heartbeat", name, note=client_id)
+    return jsonify(ok=True, name=name, expires_at=entry["expires_at"], ttl_ms=ttl_ms)
+
+
+@app.delete("/v1/accounts/<name>/presence")
+def leave_presence(name: str):
+    """Best-effort goodbye — the TTL removes the entry anyway."""
+    if not NAME_RE.match(name):
+        abort(400, description="invalid account name")
+    body = request.get_json(force=True, silent=True)
+    client_id = str((body or {}).get("client_id") or "").strip()
+    if client_id == "":
+        return jsonify(error="client_id is required"), 400
+
+    with registry_lock():
+        presence = prune_presence(load_presence())
+        holders = presence.get(name)
+        removed = bool(isinstance(holders, dict) and holders.pop(client_id, None))
+        if isinstance(holders, dict) and not holders:
+            presence.pop(name, None)
+        save_presence(presence)
+
+    audit("presence.leave", name, ok=removed, note=client_id)
+    return jsonify(ok=True, name=name, removed=removed)
+
+
+@app.get("/v1/accounts/<name>/presence")
+def get_presence(name: str):
+    """Who is using this account right now (stale heartbeats already dropped)."""
+    if not NAME_RE.match(name):
+        abort(400, description="invalid account name")
+    with registry_lock():
+        presence = prune_presence(load_presence())
+        holders = presence.get(name)
+        entries = [entry for entry in (holders or {}).values() if isinstance(entry, dict)]
+        entries.sort(key=lambda entry: str(entry.get("since") or ""))
+        # expires_at_epoch is bookkeeping; the response keeps the readable one.
+        users = [
+            {key: value for key, value in entry.items() if key != "expires_at_epoch"}
+            for entry in entries
+        ]
+    return jsonify(ok=True, name=name, users=users, count=len(users))
+
+
+@app.get("/v1/presence")
+def get_all_presence():
+    """Every account in use right now, plus a headcount.
+
+    The headcount de-duplicates by client id: one machine logged into two
+    accounts is still one person, which is what "how many people are using
+    this?" is asking.
+    """
+    with registry_lock():
+        presence = prune_presence(load_presence())
+        accounts: dict[str, list] = {}
+        clients: set[str] = set()
+        for name, holders in presence.items():
+            entries = [entry for entry in holders.values() if isinstance(entry, dict)]
+            if not entries:
+                continue
+            entries.sort(key=lambda entry: str(entry.get("since") or ""))
+            accounts[name] = [
+                {key: value for key, value in entry.items() if key != "expires_at_epoch"}
+                for entry in entries
+            ]
+            for entry in entries:
+                clients.add(str(entry.get("client_id") or ""))
+
+    return jsonify(
+        ok=True,
+        accounts=accounts,
+        total_users=len(clients),
+        accounts_in_use=len(accounts),
+    )
+
+
 @app.delete("/v1/accounts/<name>")
 def delete_account(name: str):
     if not NAME_RE.match(name):
@@ -459,6 +632,10 @@ def delete_account(name: str):
         if name in leases:
             leases.pop(name, None)
             save_leases(leases)
+        presence = load_presence()
+        if name in presence:
+            presence.pop(name, None)
+            save_presence(presence)
     audit("delete", name)
     return jsonify(ok=True)
 

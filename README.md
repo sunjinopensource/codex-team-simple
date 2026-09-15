@@ -56,6 +56,25 @@ node dist/cli.js ui
 
 Without a token the console keeps working on its one-shot local token alone, and says so at startup.
 
+### Registry (server alignment)
+
+The console mirrors the registry server's accounts automatically — once at launch, then every 5 minutes (`AUTO_SYNC_INTERVAL_MS`). Point it at a server with either:
+
+| Env | Meaning |
+|---|---|
+| `CODEXM_REGISTRY_URL` | server base url, e.g. `http://127.0.0.1:8787` |
+| `CODEXM_REGISTRY_TOKEN` | bearer token (`<registry-data>/token.txt`, or `CODEXM_REGISTRY_TOKEN` on the server) |
+
+Both become the `env` remote and take over as the default, so nothing has to be written to `~/.codex-team/remotes.json`. Alternatively keep using that file (`{"remotes": {"<name>": {"url": ..., "token": ...}}, "default_remote": "<name>"}`); the environment wins when set. Without either, the console manages local accounts only and says so at startup.
+
+### Presence (who is using an account)
+
+Every 60s the console heartbeats the managed account it is currently logged into, together with the OA user behind it (`src/registry/presence.ts`). Switching away or stopping the console clears the entry immediately, and the server expires anything that stops reporting (TTL 150s), so a machine that crashed or went offline drops out of the list by itself. The header shows the live headcount (`N 人在使用 · M 个账号`, click it for the full list), accounts in use carry a `N 人在用` badge, and a managed account's ⋯ menu has 「当前使用者」for that account alone. The headcount de-duplicates by client id, so one machine on two accounts is still one person; without a registry it is simply not shown.
+
+### Restarting Codex Desktop on Windows
+
+On Windows Codex Desktop ships as an MSIX package (`C:\Program Files\WindowsApps\OpenAI.Codex_<version>_x64__<publisher>\app\ChatGPT.exe`). Those executables are activation-only: `CreateProcess` on them is denied, so a plain `spawn` fails with `spawn EPERM`. The console detects that install and activates the app through the shell instead (`shell:AppsFolder\<PackageFamilyName>!<ApplicationId>`, the same thing the Start menu does); classic installs under `%LOCALAPPDATA%\Programs\codex` are still spawned directly. Shell activation carries no command-line flags and no environment overrides, so `CODEX_API_BASE_URL` cannot be injected into an MSIX Desktop — Windows Desktop ignores `--remote-debugging-port` anyway.
+
 ## Run the registry server
 
 ```bash

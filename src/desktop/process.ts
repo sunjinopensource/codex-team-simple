@@ -1,4 +1,6 @@
 import { spawn as spawnCallback } from "node:child_process";
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
 
 import type { CodexmPlatform } from "../platform.js";
 import { getCodexBinarySuffix } from "../platform.js";
@@ -84,6 +86,70 @@ export async function readProcessEnvironmentVariable(
   }
 }
 
+const WINDOWS_APPS_DIRECTORY = "windowsapps";
+const DEFAULT_MSIX_APPLICATION_ID = "App";
+
+/**
+ * Split `...\WindowsApps\OpenAI.Codex_26.908.4834.0_x64__2p2nqsd0c76g0\app\…`
+ * into the package family name (`OpenAI.Codex_2p2nqsd0c76g0`) and the package
+ * directory, or null when the path is not an MSIX install.
+ */
+function parseWindowsPackageIdentity(binaryPath: string): {
+  familyName: string;
+  packageDirectory: string;
+} | null {
+  const segments = binaryPath.split("\\");
+  const index = segments.findIndex(
+    (segment) => segment.toLowerCase() === WINDOWS_APPS_DIRECTORY,
+  );
+  const packageFullName = index >= 0 ? segments[index + 1] : undefined;
+  if (!packageFullName) {
+    return null;
+  }
+
+  // Full package name: Name_Version_Architecture_ResourceId_PublisherId.
+  const parts = packageFullName.split("_");
+  if (parts.length < 3) {
+    return null;
+  }
+
+  return {
+    familyName: `${parts[0]}_${parts[parts.length - 1]}`,
+    packageDirectory: segments.slice(0, index + 2).join("\\"),
+  };
+}
+
+async function readMsixApplicationId(packageDirectory: string): Promise<string> {
+  try {
+    const manifest = await readFile(join(packageDirectory, "AppxManifest.xml"), "utf8");
+    const applicationId = manifest.match(/<Application\b[^>]*\bId="([^"]+)"/iu)?.[1];
+    if (applicationId) {
+      return applicationId;
+    }
+  } catch {
+    // Unreadable manifest: fall back to the conventional id below.
+  }
+
+  return DEFAULT_MSIX_APPLICATION_ID;
+}
+
+/**
+ * MSIX packages cannot be started with `CreateProcess`: the executables under
+ * `C:\Program Files\WindowsApps` are activation-only (spawn fails with EPERM),
+ * and the app only runs once the shell activates it by its application user
+ * model id — the same thing the Start menu does. Anything else (a classic
+ * install under `%LOCALAPPDATA%\Programs\codex`) stays a plain spawn.
+ */
+async function resolveWindowsActivationTarget(binaryPath: string): Promise<string | null> {
+  const identity = parseWindowsPackageIdentity(binaryPath);
+  if (!identity) {
+    return null;
+  }
+
+  const applicationId = await readMsixApplicationId(identity.packageDirectory);
+  return `shell:AppsFolder\\${identity.familyName}!${applicationId}`;
+}
+
 export async function launchManagedDesktopProcess(options: {
   appPath: string;
   binaryPath: string;
@@ -91,6 +157,11 @@ export async function launchManagedDesktopProcess(options: {
   env?: Record<string, string>;
   platform?: CodexmPlatform;
 }, spawnImpl: SpawnLike = spawnCallback): Promise<void> {
+  const isWindows = (options.platform ?? "darwin") === "win32";
+  const activationTarget = isWindows
+    ? await resolveWindowsActivationTarget(options.binaryPath)
+    : null;
+
   await new Promise<void>((resolve, reject) => {
     // Launch through LaunchServices so Electron's own update/restart flow can
     // quit and relaunch the app cleanly. Spawning the inner binary directly
@@ -101,20 +172,28 @@ export async function launchManagedDesktopProcess(options: {
       `${key}=${value}`,
     ]);
 
-    // On Windows there is no LaunchServices: spawn the executable directly.
-    // Codex Desktop ignores --remote-debugging-port there, but passing it is
-    // harmless and keeps a single launch contract across platforms.
+    // On Windows there is no LaunchServices, and an MSIX install (the usual
+    // one) cannot be spawned directly, so hand the activation to the shell.
+    // `start` returns as soon as the activation is requested, and it carries
+    // neither command-line flags nor environment overrides — Windows Desktop
+    // ignores --remote-debugging-port anyway, and an api base URL has to be
+    // applied through the app's own settings.
     const child =
-      (options.platform ?? "darwin") === "win32"
-        ? spawnImpl(options.binaryPath, [...options.args], {
+      activationTarget
+        ? spawnImpl("cmd", ["/c", "start", "", activationTarget], {
             detached: true,
             stdio: "ignore",
-            env: { ...process.env, ...(options.env ?? {}) },
           })
-        : spawnImpl("open", [...envArgs, "-na", options.appPath, "--args", ...options.args], {
-            detached: true,
-            stdio: "ignore",
-          });
+        : isWindows
+          ? spawnImpl(options.binaryPath, [...options.args], {
+              detached: true,
+              stdio: "ignore",
+              env: { ...process.env, ...(options.env ?? {}) },
+            })
+          : spawnImpl("open", [...envArgs, "-na", options.appPath, "--args", ...options.args], {
+              detached: true,
+              stdio: "ignore",
+            });
 
     let settled = false;
 
